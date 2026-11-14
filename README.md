@@ -347,19 +347,19 @@ curl http://127.0.0.1:18610/v1/videos \
 生成链路和 Muse 自己的 web 客户端一致：
 
 ```text
-HTTP bootstrap: /api/session → VM 唤醒 → /api/hatch/token → /api/hatch/noise-notary-token
+HTTP bootstrap: /api/auth/check → access_token → /api/session → VM 唤醒 → /api/hatch/token（Bearer access_token）→ /api/hatch/noise-notary-token
 WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&app_id=hatch-web
+TLS:            Chrome ClientHello 指纹；校验证书链
 加密:           Noise_XX_25519_AESGCM_SHA256（X25519 + HKDF + AES-GCM，4+8 字节 big-endian nonce）
 帧:             NoiseTransportFrame → ServiceFrame → ApplicationRequest/ApplicationResponse
-应用层:         /api/nodes/register → /client/register-capabilities
-                POST /chat/subscribe（增量）→ POST /chat/stream → GET /chat/history
+应用层:         读取 GET /chat/history 基线 → POST /chat/stream → 轮询 GET /chat/history
                 媒体从 /media/raw 或 /fs/raw 下载
 额度:           POST /（Next-Action: fetchSubscriptionAction，React Flight 响应）
 ```
 
-已用真实账号验收：文生图、参考图编辑、多图参考、参考图视频、文生视频、混合并发都能完成，媒体正常落盘；对话按上游 `chat.subscribe` 的增量逐字转发为 SSE；视频结果的时长和分辨率从 MP4 元数据解析。
+生成请求通过 Muse 的 hatch Noise 网关传输；对话以 `chat.history` 中正在变化的 assistant 事件转成 SSE 增量，并在 Muse 标记完成后结束。视频结果的时长和分辨率从 MP4 元数据解析。
 
-额度刷新也走纯 HTTP：Muse 的首页应用通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化；遇到 Muse 返回的客户端错误时，会扫描首页引用的脚本和懒加载模块，重新定位 action 并重试一次，成功后缓存新标识。认证失败和限流不会触发脚本扫描。
+额度刷新也走纯 HTTP：Muse 的首页应用通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化；遇到 Muse 返回的客户端错误时，会沿首页 Settings 懒加载模块表定位对应脚本，重新发现 action 并重试一次，成功后缓存新标识。认证失败和限流不会触发脚本扫描。
 
 ### 账号连接与保活
 

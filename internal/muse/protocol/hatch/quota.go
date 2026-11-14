@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,17 +28,19 @@ const (
 	quotaPagePath       = "/"
 	quotaActionTTL      = 12 * time.Hour
 	quotaScanWorkers    = 12
-	quotaScanLimit      = 512
+	quotaPageChunkLimit = 96
+	quotaSettingsLimit  = 32
 	quotaChunkMaxBytes  = 2 << 20
 	quotaBodyMaxBytes   = 4 << 20
 )
 
 var (
-	actionHexRe  = regexp.MustCompile(`[0-9a-f]{40,}`)
-	chunkURLRe   = regexp.MustCompile(`(/_next/static/chunks/[A-Za-z0-9_~.-]+\.js[^"'\s]*)`)
-	chunkNameRe  = regexp.MustCompile(`static/chunks/([A-Za-z0-9_~.-]+\.js)`)
-	dplRe        = regexp.MustCompile(`dpl_[A-Za-z0-9]+`)
-	loginMarkers = []string{"sign in", "log in", "login", "登录", "signin"}
+	chunkURLRe       = regexp.MustCompile(`(/_next/static/chunks/[A-Za-z0-9_~.-]+\.js[^"'\s]*)`)
+	chunkNameRe      = regexp.MustCompile(`static/chunks/([A-Za-z0-9_~.-]+\.js)`)
+	settingsModuleRe = regexp.MustCompile(`\.A\((\d+)\)\.then\(\(\{[^}]*Settings`)
+	actionRefRe      = regexp.MustCompile(`"([0-9a-f]{40,})",[^)]{0,400}"fetchSubscriptionAction"`)
+	dplRe            = regexp.MustCompile(`dpl_[A-Za-z0-9]+`)
+	loginMarkers     = []string{"sign in", "log in", "login", "登录", "signin"}
 )
 
 // QueryQuota reads the current subscription snapshot for one account. It uses
@@ -273,9 +276,8 @@ func looksLikeLoginPage(body []byte) bool {
 	return false
 }
 
-// discoverQuotaAction scans the homepage chunks for the server-action
-// reference. The settings page is lazy-loaded, so its chunk names are found in
-// the homepage loader scripts and downloaded in a second pass.
+// discoverQuotaAction follows the homepage's lazy module table to the settings
+// chunks instead of fetching unrelated chunks.
 func (c *Client) discoverQuotaAction(ctx context.Context, cookies map[string]string) (string, error) {
 	base := strings.TrimRight(c.site.String(), "/")
 	html, err := c.fetchText(ctx, cookies, base+quotaPagePath, quotaBodyMaxBytes)
@@ -302,91 +304,90 @@ func (c *Client) discoverQuotaAction(ctx context.Context, cookies map[string]str
 	for url := range firstScreen {
 		urls = append(urls, url)
 	}
-
-	lazy := map[string]bool{}
-	if id := c.scanChunks(ctx, cookies, urls, lazy); id != "" {
+	sort.Strings(urls)
+	if len(urls) > quotaPageChunkLimit {
+		urls = urls[:quotaPageChunkLimit]
+	}
+	firstScreenText := c.fetchChunks(ctx, cookies, urls)
+	if id := actionIDFromChunk(firstScreenText); id != "" {
 		return id, nil
 	}
 
-	lazyURLs := make([]string, 0, len(lazy))
-	for name := range lazy {
+	module := settingsModuleRe.FindStringSubmatch(firstScreenText)
+	if len(module) < 2 {
+		return "", errors.New("首页应用中没有找到设置模块")
+	}
+	loaderRe, err := regexp.Compile(`(?:^|[,{\[])` + regexp.QuoteMeta(module[1]) + `,\w+=>\{\w+\.v\(\w+=>Promise\.all\(\[([^\]]*)`)
+	if err != nil {
+		return "", err
+	}
+	loader := loaderRe.FindStringSubmatch(firstScreenText)
+	if len(loader) < 2 {
+		return "", errors.New("首页应用中没有找到设置模块加载表")
+	}
+
+	settingsNames := map[string]struct{}{}
+	for _, match := range chunkNameRe.FindAllStringSubmatch(loader[1], -1) {
+		settingsNames[match[1]] = struct{}{}
+	}
+	settingsURLs := make([]string, 0, len(settingsNames))
+	for name := range settingsNames {
 		url := base + "/_next/static/chunks/" + name
 		if dpl != "" {
 			url += "?dpl=" + dpl
 		}
-		lazyURLs = append(lazyURLs, url)
+		settingsURLs = append(settingsURLs, url)
 	}
-	if len(lazyURLs) > quotaScanLimit {
-		lazyURLs = lazyURLs[:quotaScanLimit]
+	sort.Strings(settingsURLs)
+	if len(settingsURLs) == 0 {
+		return "", errors.New("设置模块加载表没有引用脚本")
 	}
-	if id := c.scanChunks(ctx, cookies, lazyURLs, nil); id != "" {
+	if len(settingsURLs) > quotaSettingsLimit {
+		settingsURLs = settingsURLs[:quotaSettingsLimit]
+	}
+	if id := actionIDFromChunk(c.fetchChunks(ctx, cookies, settingsURLs)); id != "" {
 		return id, nil
 	}
-	return "", errors.New("部署的脚本中没有找到额度接口标识")
+	return "", errors.New("设置脚本中没有找到额度接口标识")
 }
 
-// scanChunks downloads chunks concurrently and returns the first action id.
-func (c *Client) scanChunks(ctx context.Context, cookies map[string]string, urls []string, lazy map[string]bool) string {
-	scanCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var once sync.Once
-	var mu sync.Mutex
-	found := ""
+func (c *Client) fetchChunks(ctx context.Context, cookies map[string]string, urls []string) string {
 	sem := make(chan struct{}, quotaScanWorkers)
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var texts strings.Builder
 
-outer:
 	for _, url := range urls {
 		select {
-		case <-scanCtx.Done():
-			break outer
 		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+		if ctx.Err() != nil {
+			break
 		}
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			text, err := c.fetchText(scanCtx, cookies, url, quotaChunkMaxBytes)
+			text, err := c.fetchText(ctx, cookies, url, quotaChunkMaxBytes)
 			if err != nil {
 				return
 			}
-			if lazy != nil {
-				mu.Lock()
-				for _, match := range chunkNameRe.FindAllStringSubmatch(text, -1) {
-					lazy[match[1]] = true
-				}
-				mu.Unlock()
-			}
-			if id := actionIDFromChunk(text); id != "" {
-				once.Do(func() {
-					found = id
-					cancel()
-				})
-			}
+			mu.Lock()
+			texts.WriteString(text)
+			texts.WriteByte('\n')
+			mu.Unlock()
 		}(url)
 	}
 	wg.Wait()
-	return found
+	return texts.String()
 }
 
 func actionIDFromChunk(text string) string {
-	idx := strings.Index(text, quotaActionName)
-	if idx < 0 {
-		return ""
-	}
-	start := idx - 600
-	if start < 0 {
-		start = 0
-	}
-	end := idx + len(quotaActionName) + 120
-	if end > len(text) {
-		end = len(text)
-	}
-	for _, candidate := range actionHexRe.FindAllString(text[start:end], -1) {
-		if len(candidate) >= 40 {
-			return candidate
-		}
+	match := actionRefRe.FindStringSubmatch(text)
+	if len(match) > 1 {
+		return match[1]
 	}
 	return ""
 }

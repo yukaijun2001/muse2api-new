@@ -328,7 +328,7 @@ func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountC
 		CookieExpiry: credentials.CookieExpiry,
 		Client:       d.cfg.HTTPClient,
 	}
-	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session", nil)
+	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session", nil, "")
 	if err != nil {
 		return nil, err
 	}

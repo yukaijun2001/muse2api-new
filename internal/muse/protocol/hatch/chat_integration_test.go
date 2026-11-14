@@ -2,14 +2,14 @@ package hatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,9 +21,9 @@ import (
 func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 	t.Helper()
 	var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	var mu sync.Mutex
-	subscribeID := int64(-1)
-	subscribeReady := make(chan struct{}, 1)
+	turnSent := false
+	chatPrompt := ""
+	historyPolls := 0
 	handler := func(ws *websocket.Conn) {
 		defer ws.Close()
 		responder := newNoiseXXResponder()
@@ -72,38 +72,45 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 			_, path, body := parseTestRequest(frame.Request)
 			basePath := strings.SplitN(path, "?", 2)[0]
 			switch basePath {
-			case "/api/nodes/register", "/client/register-capabilities":
-				sendTestResponse(ws, tx, frame.StreamID, 200, []byte(`{}`), true)
-			case "/chat/subscribe":
-				mu.Lock()
-				subscribeID = frame.StreamID
-				mu.Unlock()
-				sendTestResponse(ws, tx, frame.StreamID, 200, nil, false)
-				select {
-				case subscribeReady <- struct{}{}:
-				default:
-				}
 			case "/chat/stream":
-				_ = body
-				sendTestResponse(ws, tx, frame.StreamID, 200, []byte(`{"message_id":"m1"}`), true)
-				if silent {
-					continue
+				var request map[string]any
+				if err := json.Unmarshal(body, &request); err != nil {
+					t.Errorf("decode chat.stream body: %v", err)
+				} else {
+					if _, ok := request["message"]; ok {
+						t.Error("chat.stream body unexpectedly contains legacy message field")
+					}
+					if _, ok := request["session_id"]; ok {
+						t.Error("main chat request unexpectedly contains session_id")
+					}
+					if _, ok := request["timezone"]; ok {
+						t.Error("chat.stream body unexpectedly contains timezone")
+					}
+					if caps, ok := request["capabilities"].(map[string]any); !ok || len(caps) != 0 {
+						t.Errorf("chat.stream capabilities = %#v, want empty object", request["capabilities"])
+					}
+					if items, ok := request["items"].([]any); ok && len(items) > 0 {
+						if item, ok := items[len(items)-1].(map[string]any); ok {
+							chatPrompt, _ = item["text"].(string)
+						}
+					}
 				}
-				select {
-				case <-subscribeReady:
-				case <-time.After(time.Second):
-					continue
-				}
-				mu.Lock()
-				id := subscribeID
-				mu.Unlock()
-				now := time.Now().UnixMilli()
-				lines := fmt.Sprintf(`{"event":"delta.text_append","payload":{"text":"hel"},"ts_ms":%d}`+"\n"+
-					`{"event":"delta.text_append","payload":{"text":"lo"},"ts_ms":%d}`+"\n"+
-					`{"event":"delta.message_done","payload":{},"ts_ms":%d}`, now, now, now)
-				sendTestBody(ws, tx, id, []byte(lines), true)
+				turnSent = true
+				continue
 			case "/chat/history":
-				history := `{"chat_events":[{"message_id":"m1","event_name":"message.user","text":"draw"},{"event_name":"message.assistant","payload":{"kind":"image","path":"sandbox://gen.png","display_text":"done"}}]}`
+				history := `{"chat_events":[]}`
+				if turnSent && (chatPrompt == "draw" || !silent) {
+					historyPolls++
+					assistant := `{"seq":2,"event_name":"message.assistant","payload":{"status":"completed","display_text":"hello"}}`
+					if chatPrompt == "hi" && historyPolls == 1 {
+						assistant = `{"seq":2,"event_name":"message.assistant","payload":{"status":"running","display_text":"hel"}}`
+					} else if chatPrompt == "draw" {
+						assistant = `{"seq":2,"event_name":"message.assistant","payload":{"status":"completed","kind":"image","path":"sandbox://gen.png","display_text":"done"}}`
+					} else if chatPrompt == "hi" {
+						assistant = `{"seq":2,"event_name":"message.assistant","payload":{"status":"completed","display_text":"hello"}}`
+					}
+					history = `{"chat_events":[{"seq":1,"event_name":"message.user","text":"` + chatPrompt + `"},` + assistant + `]}`
+				}
 				sendTestResponse(ws, tx, frame.StreamID, 200, []byte(history), true)
 			default:
 				if strings.HasPrefix(path, "/media/raw/") || strings.HasPrefix(path, "/fs/raw/") {
@@ -118,13 +125,25 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 		}
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/auth/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("auth/check method = %s", r.Method)
+		}
+		_, _ = io.WriteString(w, `{"access_token":"access"}`)
+	})
 	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"vm_id":"vm1","endpoint_url":"https://vm1","vm_state":"RUNNING"}`))
 	})
 	mux.HandleFunc("/api/hatch/token", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer access" {
+			t.Errorf("hatch/token Authorization = %q", got)
+		}
 		_, _ = w.Write([]byte(`{"token":"token"}`))
 	})
 	mux.HandleFunc("/api/hatch/noise-notary-token", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer access" {
+			t.Errorf("noise-notary Authorization = %q", got)
+		}
 		_, _ = w.Write([]byte(`{"notaryToken":"notary"}`))
 	})
 	mux.HandleFunc("/v1/noise", func(w http.ResponseWriter, r *http.Request) {

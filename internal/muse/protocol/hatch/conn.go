@@ -513,6 +513,118 @@ func (c *Conn) RequestTo(ctx context.Context, method, path string, params map[st
 	return c.request(ctx, method, path, params, timeout, sink)
 }
 
+// Send opens a non-blocking RPC. It is used for fire-and-forget Muse actions
+// such as chat.stream, whose result is read from chat.history.
+func (c *Conn) Send(ctx context.Context, method, path string, params map[string]any) error {
+	if c.IsClosed() {
+		return errors.New("gateway connection closed")
+	}
+	body := []byte(nil)
+	if method != http.MethodGet && method != http.MethodDelete {
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return err
+		}
+		body = encoded
+	} else if len(params) > 0 {
+		query := url.Values{}
+		for key, value := range params {
+			query.Set(key, fmt.Sprint(value))
+		}
+		if encoded := query.Encode(); encoded != "" {
+			separator := "?"
+			if containsRune(path, '?') {
+				separator = "&"
+			}
+			path += separator + encoded
+		}
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("gateway connection closed")
+	}
+	streamID := c.nextID
+	c.nextID++
+	c.mu.Unlock()
+
+	headers := []Header{{Key: "x-request-id", Value: randomRequestID()}}
+	if len(body) > 0 {
+		headers = append(headers, Header{Key: "Content-Type", Value: "application/json"})
+	}
+	frame := encodeServiceFrameRequest(streamID, ApplicationRequest{
+		Verb: method, Path: path, Headers: headers, Body: body, EndBody: true,
+	})
+	if err := c.writeEncrypted(encodeServiceRequest(serviceDaemon, frame)); err != nil {
+		return fmt.Errorf("gateway send %s %s: %w", method, path, err)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+type StreamHandle struct {
+	conn   *Conn
+	stream *stream
+	once   sync.Once
+}
+
+func (h *StreamHandle) Events() <-chan map[string]any { return h.stream.records }
+
+func (h *StreamHandle) Err() error {
+	h.stream.mu.Lock()
+	defer h.stream.mu.Unlock()
+	return h.stream.err
+}
+
+func (h *StreamHandle) Close() {
+	h.once.Do(func() {
+		if !h.conn.IsClosed() {
+			reset := encodeServiceFrameReset(h.stream.id, 1, "client done")
+			_ = h.conn.writeEncrypted(encodeServiceRequest(serviceDaemon, reset))
+		}
+		h.conn.dropStream(h.stream.id)
+	})
+}
+
+func (c *Conn) OpenStream(ctx context.Context, path string, params map[string]any) (*StreamHandle, error) {
+	if c.IsClosed() {
+		return nil, errors.New("gateway connection closed")
+	}
+	body, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	s, err := c.newStreamState(true)
+	if err != nil {
+		return nil, err
+	}
+	headers := []Header{
+		{Key: "Content-Type", Value: "application/json"},
+		{Key: "x-request-id", Value: randomRequestID()},
+		{Key: "x-app-id", Value: "hatch-web"},
+		{Key: "Accept-Language", Value: "en-US"},
+	}
+	frame := encodeServiceFrameRequest(s.id, ApplicationRequest{
+		Verb: http.MethodPost, Path: path, Headers: headers, Body: body, EndBody: true,
+	})
+	if err := c.writeEncrypted(encodeServiceRequest(serviceDaemon, frame)); err != nil {
+		c.dropStream(s.id)
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		c.dropStream(s.id)
+		return nil, ctx.Err()
+	default:
+	}
+	return &StreamHandle{conn: c, stream: s}, nil
+}
+
 func (c *Conn) request(ctx context.Context, method, path string, params map[string]any, timeout time.Duration, sink func([]byte) error) (*RpcResult, error) {
 	if c.IsClosed() {
 		return nil, errors.New("gateway connection closed")
@@ -586,72 +698,6 @@ func (c *Conn) request(ctx context.Context, method, path string, params map[stri
 		}
 		return &RpcResult{Status: s.status, Headers: s.headers, Body: s.body}, nil
 	}
-}
-
-// StreamHandle is one open streaming RPC (chat.subscribe).
-type StreamHandle struct {
-	conn   *Conn
-	stream *stream
-	once   sync.Once
-}
-
-// Events yields parsed JSON records until the stream ends. The consumer must
-// keep reading; feedBody applies backpressure to the shared connection.
-func (h *StreamHandle) Events() <-chan map[string]any {
-	return h.stream.records
-}
-
-// Err reports the terminal stream error, if any.
-func (h *StreamHandle) Err() error {
-	h.stream.mu.Lock()
-	defer h.stream.mu.Unlock()
-	return h.stream.err
-}
-
-// Close resets the upstream stream and forgets it.
-func (h *StreamHandle) Close() {
-	h.once.Do(func() {
-		if !h.conn.IsClosed() {
-			reset := encodeServiceFrameReset(h.stream.id, 1, "client done")
-			_ = h.conn.writeEncrypted(encodeServiceRequest(serviceDaemon, reset))
-		}
-		h.conn.dropStream(h.stream.id)
-	})
-}
-
-// OpenStream starts a POST streaming RPC and returns a handle for its records.
-func (c *Conn) OpenStream(ctx context.Context, path string, params map[string]any) (*StreamHandle, error) {
-	if c.IsClosed() {
-		return nil, errors.New("gateway connection closed")
-	}
-	body, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-	s, err := c.newStreamState(true)
-	if err != nil {
-		return nil, err
-	}
-	headers := []Header{
-		{Key: "Content-Type", Value: "application/json"},
-		{Key: "x-request-id", Value: randomRequestID()},
-		{Key: "x-app-id", Value: "hatch-web"},
-		{Key: "Accept-Language", Value: "en-US"},
-	}
-	frameBytes := encodeServiceFrameRequest(s.id, ApplicationRequest{
-		Verb: http.MethodPost, Path: path, Headers: headers, Body: body, EndBody: true,
-	})
-	if err := c.writeEncrypted(encodeServiceRequest(serviceDaemon, frameBytes)); err != nil {
-		c.dropStream(s.id)
-		return nil, err
-	}
-	select {
-	case <-ctx.Done():
-		c.dropStream(s.id)
-		return nil, ctx.Err()
-	default:
-	}
-	return &StreamHandle{conn: c, stream: s}, nil
 }
 
 func containsRune(s string, r rune) bool {

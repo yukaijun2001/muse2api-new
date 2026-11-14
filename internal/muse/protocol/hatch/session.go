@@ -30,6 +30,7 @@ type Session struct {
 	VMID         string
 	Endpoint     string
 	AuthToken    string
+	AccessToken  string
 	Notary       string
 	WSURL        string
 	Cookies      map[string]string
@@ -78,7 +79,16 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 		appID = DefaultAppID
 	}
 
-	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil)
+	accessResp, err := opts.requestJSON(ctx, http.MethodPost, "/api/auth/check", nil, "")
+	if err != nil {
+		return nil, fmt.Errorf("muse.ai auth check: %w", err)
+	}
+	accessToken := strings.TrimSpace(asString(accessResp["access_token"]))
+	if accessToken == "" {
+		return nil, errors.New("auth/check response is missing access_token")
+	}
+
+	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -90,12 +100,12 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	}
 
 	if !strings.EqualFold(state, "RUNNING") {
-		if err := opts.wakeVM(ctx, vmID); err != nil {
+		if err := opts.wakeVM(ctx, vmID, accessToken); err != nil {
 			return nil, err
 		}
 		deadline := time.Now().Add(45 * time.Second)
 		for {
-			info, err = opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil)
+			info, err = opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil, "")
 			if err == nil {
 				if id := asString(info["vm_id"]); id != "" {
 					vmID = id
@@ -125,20 +135,21 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 		}
 	}
 
+	vmAddress := "wss://" + vmID + ".metaaivm.com/"
 	tokenResp, err := opts.requestJSON(ctx, http.MethodPost, "/api/hatch/token", map[string]any{
-		"vmAddress": endpoint,
+		"vmAddress": vmAddress,
 		"vmName":    vmID,
-	})
+	}, accessToken)
 	if err != nil {
 		var authErr *AuthError
 		if errors.As(err, &authErr) {
 			// A stale hatch_vml cookie is the usual cause of 401/403 here;
 			// refresh /api/session once and retry the token request.
-			if _, refreshErr := opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil); refreshErr == nil {
+			if _, refreshErr := opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil, ""); refreshErr == nil {
 				tokenResp, err = opts.requestJSON(ctx, http.MethodPost, "/api/hatch/token", map[string]any{
-					"vmAddress": endpoint,
+					"vmAddress": vmAddress,
 					"vmName":    vmID,
-				})
+				}, accessToken)
 			}
 		}
 	}
@@ -151,7 +162,7 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	}
 
 	notary := ""
-	if nr, err := opts.requestJSON(ctx, http.MethodPost, "/api/hatch/noise-notary-token", map[string]any{"vmName": vmID}); err == nil {
+	if nr, err := opts.requestJSON(ctx, http.MethodPost, "/api/hatch/noise-notary-token", map[string]any{"vmName": vmID}, accessToken); err == nil {
 		notary = strings.TrimSpace(asString(nr["notaryToken"]))
 	}
 
@@ -167,10 +178,10 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	if wsURL == "" {
 		wsURL = "wss://" + lbHost + wsPath + "?" + params.Encode()
 	}
-	return &Session{VMID: vmID, Endpoint: endpoint, AuthToken: authToken, Notary: notary, WSURL: wsURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
+	return &Session{VMID: vmID, Endpoint: endpoint, AuthToken: authToken, AccessToken: accessToken, Notary: notary, WSURL: wsURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
 }
 
-func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, body any) (map[string]any, error) {
+func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, body any, accessToken string) (map[string]any, error) {
 	var reader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
@@ -188,9 +199,7 @@ func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, b
 	// reference implementation relies on the same set.
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9,en-GB;q=0.8")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Cookie", cookieHeader(o.Cookies))
 	origin := o.BaseURL.Scheme + "://" + o.BaseURL.Host
 	req.Header.Set("Origin", origin)
@@ -198,6 +207,9 @@ func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, b
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 	req.Header.Set("Priority", "u=4")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -239,7 +251,7 @@ func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, b
 	return out, nil
 }
 
-func (o *SessionOptions) wakeVM(ctx context.Context, vmID string) error {
+func (o *SessionOptions) wakeVM(ctx context.Context, vmID, accessToken string) error {
 	attempt := make([]byte, 16)
 	if _, err := rand.Read(attempt); err != nil {
 		return err
@@ -248,7 +260,7 @@ func (o *SessionOptions) wakeVM(ctx context.Context, vmID string) error {
 		"vm_id":              vmID,
 		"retry_count":        0,
 		"connect_attempt_id": hex.EncodeToString(attempt),
-	})
+	}, accessToken)
 	return err
 }
 

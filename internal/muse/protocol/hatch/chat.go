@@ -29,13 +29,6 @@ const (
 	chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 )
 
-var capabilitiesList = []string{
-	"chat_cancel",
-	"delta_stream",
-	"custom_reactions",
-	"custom_reactions_facebook_thumbs_up_v1",
-}
-
 // MediaRef is one generated artifact exposed by the upstream turn.
 type MediaRef struct {
 	Kind  string // image | video
@@ -94,7 +87,6 @@ type Client struct {
 	dialer     *websocket.Dialer
 	httpClient *http.Client
 	nodeID     string
-	registered bool
 
 	// quotaActionID caches the Next.js server-action id that returns the
 	// subscription snapshot. The id is build-specific, so it is re-discovered
@@ -145,7 +137,6 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 		_ = c.conn.Close()
 		c.conn = nil
 		c.session = nil
-		c.registered = false
 		c.connKey = ""
 	}
 	session, err := Bootstrap(ctx, SessionOptions{
@@ -166,7 +157,6 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 	}
 	c.conn = conn
 	c.session = session
-	c.registered = false
 	c.connKey = key
 	return conn, nil
 }
@@ -178,7 +168,6 @@ func (c *Client) forgetConnection() {
 	}
 	c.conn = nil
 	c.session = nil
-	c.registered = false
 	c.connKey = ""
 	c.mu.Unlock()
 }
@@ -194,47 +183,8 @@ func (c *Client) invalidate() {
 	}
 	c.conn = nil
 	c.session = nil
-	c.registered = false
 	c.connKey = ""
 	c.mu.Unlock()
-}
-
-func (c *Client) register(ctx context.Context, conn *Conn) error {
-	c.mu.Lock()
-	done := c.registered
-	c.mu.Unlock()
-	if done {
-		return nil
-	}
-	_, _ = conn.Request(ctx, http.MethodPost, "/api/nodes/register", map[string]any{
-		"node_id":      c.nodeID,
-		"display_name": "Web",
-		"platform":     "web",
-		"commands_v2":  map[string]any{"ping": map[string]any{"description": "Connection liveness check"}},
-	}, 15*time.Second)
-	_, err := conn.Request(ctx, http.MethodPost, "/client/register-capabilities", map[string]any{
-		"client_id":    c.nodeID,
-		"platform":     "web",
-		"display_name": "Muse Web",
-		"version":      "0.0.0",
-		"capabilities": map[string]any{
-			"data_sources":       map[string]any{},
-			"device_commands":    map[string]any{},
-			"hatch_app_commands": map[string]any{},
-			"rendering": map[string]any{
-				"supported_presentations":        []string{"text_with_button", "generic_list"},
-				"supported_inline_presentations": []string{"option"},
-				"supported_text_entities":        []string{},
-			},
-		},
-	}, 15*time.Second)
-	if err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.registered = true
-	c.mu.Unlock()
-	return nil
 }
 
 // ChatItem is one attachment or text entry in the outgoing chat turn, matching
@@ -260,13 +210,9 @@ func (c *Client) ChatWithItems(ctx context.Context, credentials map[string]strin
 	}
 	c.chatMu.Lock()
 	defer c.chatMu.Unlock()
-	sessionID := randomRequestID()
 	deadline := time.Now().Add(timeout)
 	conn, err := c.connect(ctx, credentials)
 	if err != nil {
-		return "", nil, err
-	}
-	if err := c.register(ctx, conn); err != nil {
 		return "", nil, err
 	}
 
@@ -277,26 +223,20 @@ func (c *Client) ChatWithItems(ctx context.Context, credentials map[string]strin
 	items = append(items, ChatItem{Type: "text", Text: prompt})
 	body := map[string]any{
 		"items":        items,
-		"message":      prompt,
 		"node_id":      c.nodeID,
-		"capabilities": capabilitiesList,
-		"session_id":   sessionID,
-		"timezone":     "UTC",
-		"metadata":     map[string]any{"thread_is_dictation_used": false},
+		"capabilities": map[string]any{},
 	}
-	messageID := ""
-	ack, err := conn.Request(ctx, http.MethodPost, "/chat/stream", body, 20*time.Second)
+	baselineResult, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": 1}, 20*time.Second)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("发送前读取对话历史: %w", err)
 	}
-	if ack != nil {
-		var payload map[string]any
-		if ack.JSON(&payload) == nil {
-			messageID = asString(payload["message_id"])
-			if messageID == "" {
-				messageID = asString(payload["id"])
-			}
-		}
+	var baselinePayload map[string]any
+	if err := baselineResult.JSON(&baselinePayload); err != nil {
+		return "", nil, fmt.Errorf("解析发送前对话历史: %w", err)
+	}
+	baseline := maxEventSeq(historyEvents(baselinePayload))
+	if err := conn.Send(ctx, http.MethodPost, "/chat/stream", body); err != nil {
+		return "", nil, err
 	}
 
 	var bestText string
@@ -319,10 +259,7 @@ func (c *Client) ChatWithItems(ctx context.Context, credentials map[string]strin
 				continue
 			}
 		}
-		result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{
-			"limit":      120,
-			"session_id": sessionID,
-		}, 20*time.Second)
+		result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": 120}, 20*time.Second)
 		if err != nil {
 			if conn.IsClosed() {
 				c.forgetConnection()
@@ -336,12 +273,7 @@ func (c *Client) ChatWithItems(ctx context.Context, credentials map[string]strin
 			continue
 		}
 		events := historyEvents(payload)
-		userIndex := findUserIndex(events, messageID, prompt)
-		if userIndex < 0 {
-			sleepCtx(ctx, pollInterval)
-			continue
-		}
-		after := events[userIndex+1:]
+		after := assistantReplies(events, baseline)
 		currentText := latestAssistantText(after)
 		var media []MediaRef
 		if wantMedia {
@@ -396,7 +328,7 @@ func (c *Client) ChatWithItems(ctx context.Context, credentials map[string]strin
 					return bestText, nil, &MediaRefusalError{Message: truncate([]byte(bestText), 240)}
 				}
 			}
-		} else if !textStableAt.IsZero() && now.Sub(textStableAt) >= textSettle {
+		} else if assistantIsFinished(after) {
 			return bestText, nil, nil
 		}
 
@@ -621,31 +553,54 @@ func eventText(event map[string]any) string {
 	return ""
 }
 
-func findUserIndex(events []map[string]any, messageID, prompt string) int {
-	if messageID != "" {
-		for index, event := range events {
-			if eventName(event) != "message.user" {
-				continue
-			}
-			if asString(event["message_id"]) == messageID {
-				return index
-			}
+func maxEventSeq(events []map[string]any) int64 {
+	var max int64
+	for _, event := range events {
+		if seq, ok := event["seq"].(float64); ok && int64(seq) > max {
+			max = int64(seq)
 		}
 	}
-	needle := strings.TrimSpace(prompt)
-	if len(needle) > 80 {
-		needle = needle[:80]
-	}
-	for index := len(events) - 1; index >= 0; index-- {
-		if eventName(events[index]) != "message.user" {
+	return max
+}
+
+func assistantReplies(events []map[string]any, baseline int64) []map[string]any {
+	replies := make([]map[string]any, 0, len(events))
+	for _, event := range events {
+		if eventName(event) != "message.assistant" {
 			continue
 		}
-		text := strings.TrimSpace(eventText(events[index]))
-		if text != "" && (text == strings.TrimSpace(prompt) || strings.Contains(text, needle)) {
-			return index
+		seq, _ := event["seq"].(float64)
+		if int64(seq) <= baseline {
+			continue
 		}
+		if asString(event["reply_to_message_id"]) != "" {
+			continue
+		}
+		if payload, ok := event["payload"].(map[string]any); ok && asString(payload["reply_to_message_id"]) != "" {
+			continue
+		}
+		if eventText(event) == "" {
+			continue
+		}
+		replies = append(replies, event)
 	}
-	return -1
+	return replies
+}
+
+func assistantIsFinished(events []map[string]any) bool {
+	if len(events) == 0 {
+		return false
+	}
+	payload, ok := events[len(events)-1]["payload"].(map[string]any)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(asString(payload["status"])) {
+	case "completed", "complete", "done", "finished":
+		return true
+	default:
+		return false
+	}
 }
 
 func latestAssistantText(events []map[string]any) string {
@@ -851,9 +806,9 @@ type ChatDelta struct {
 	Err  error
 }
 
-// ChatStream sends a prompt on the account's main chat and streams assistant
-// text deltas from chat.subscribe. The turn is serialized with all other chat
-// work because the upstream VM handles one conversation at a time.
+// ChatStream sends a prompt on the account's main chat and polls chat.history
+// for the evolving assistant text. The turn is serialized because each account
+// has one main conversation.
 func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, prompt string, timeout time.Duration) (<-chan ChatDelta, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -864,56 +819,37 @@ func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, 
 		c.chatMu.Unlock()
 		return nil, err
 	}
-	if err := c.register(ctx, conn); err != nil {
-		c.chatMu.Unlock()
-		return nil, err
-	}
-	sub, err := conn.OpenStream(ctx, "/chat/subscribe", map[string]any{
-		"after_stream_seq":     0,
-		"after_chat_event_seq": 0,
-		"capabilities":         capabilitiesList,
-	})
+	baselineResult, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": 1}, 20*time.Second)
 	if err != nil {
 		c.chatMu.Unlock()
-		return nil, err
+		return nil, fmt.Errorf("发送前读取对话历史: %w", err)
 	}
-	sleepCtx(ctx, 400*time.Millisecond)
-
-	sendStart := time.Now().UnixMilli()
+	var baselinePayload map[string]any
+	if err := baselineResult.JSON(&baselinePayload); err != nil {
+		c.chatMu.Unlock()
+		return nil, fmt.Errorf("解析发送前对话历史: %w", err)
+	}
+	baseline := maxEventSeq(historyEvents(baselinePayload))
 	body := map[string]any{
-		"message":      prompt,
 		"items":        []any{ChatItem{Type: "text", Text: prompt}},
 		"node_id":      c.nodeID,
-		"capabilities": capabilitiesList,
-		"timezone":     "UTC",
+		"capabilities": map[string]any{},
 	}
-	ack, err := conn.Request(ctx, http.MethodPost, "/chat/stream", body, 20*time.Second)
-	if err != nil {
-		sub.Close()
+	if err := conn.Send(ctx, http.MethodPost, "/chat/stream", body); err != nil {
 		c.chatMu.Unlock()
 		return nil, err
-	}
-	ackMessageID := ""
-	if ack != nil {
-		var payload map[string]any
-		if ack.JSON(&payload) == nil {
-			ackMessageID = asString(payload["message_id"])
-			if ackMessageID == "" {
-				ackMessageID = asString(payload["id"])
-			}
-		}
 	}
 
 	out := make(chan ChatDelta, 64)
+	ticker := time.NewTicker(pollInterval)
+	var emitted string
+	var lastText string
+	var stableAt time.Time
 	go func() {
 		defer close(out)
-		defer func() {
-			sub.Close()
-			c.chatMu.Unlock()
-		}()
+		defer c.chatMu.Unlock()
 		timer := time.NewTimer(timeout)
 		defer timer.Stop()
-		terminal := false
 		for {
 			select {
 			case <-ctx.Done():
@@ -924,54 +860,47 @@ func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, 
 				case <-ctx.Done():
 				}
 				return
-			case record, ok := <-sub.Events():
-				if !ok {
-					streamErr := sub.Err()
-					if streamErr == nil && !terminal {
-						streamErr = fmt.Errorf("上游对话流在完成事件前关闭: %w", protocol.ErrUpstreamUncertain)
-					}
-					if streamErr != nil {
-						select {
-						case out <- ChatDelta{Err: streamErr}:
-						case <-ctx.Done():
-						}
-					}
-					return
+			case <-ticker.C:
+				conn := c.currentConn()
+				if conn == nil {
+					continue
 				}
-				if ts, ok := record["ts_ms"].(float64); ok {
-					tsMs := int64(ts)
-					if tsMs > 0 && tsMs < 1_000_000_000 {
-						tsMs *= 1000
+				result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": 120}, 20*time.Second)
+				if err != nil {
+					if conn.IsClosed() {
+						c.forgetConnection()
 					}
-					if tsMs < sendStart {
-						continue // replay of historical events
+					continue
+				}
+				var payload map[string]any
+				if err := result.JSON(&payload); err != nil {
+					continue
+				}
+				replies := assistantReplies(historyEvents(payload), baseline)
+				text := latestAssistantText(replies)
+				if text == "" {
+					continue
+				}
+				now := time.Now()
+				if text != lastText {
+					lastText = text
+					stableAt = now
+				} else if stableAt.IsZero() {
+					stableAt = now
+				}
+				delta := text
+				if strings.HasPrefix(text, emitted) {
+					delta = strings.TrimPrefix(text, emitted)
+				}
+				if delta != "" {
+					select {
+					case out <- ChatDelta{Text: delta}:
+						emitted = text
+					case <-ctx.Done():
+						return
 					}
 				}
-				name := asString(record["event"])
-				if name == "" {
-					name = asString(record["event_name"])
-				}
-				payload, _ := record["payload"].(map[string]any)
-				if ackMessageID != "" {
-					if reply := asString(payload["reply_to_message_id"]); reply != "" && reply != ackMessageID {
-						continue
-					}
-				}
-				switch name {
-				case "delta.text_append":
-					text := asString(payload["text"])
-					if text == "" {
-						text = asString(payload["delta"])
-					}
-					if text != "" {
-						select {
-						case out <- ChatDelta{Text: text}:
-						case <-ctx.Done():
-							return
-						}
-					}
-				case "delta.message_done", "message.assistant":
-					terminal = true
+				if assistantIsFinished(replies) {
 					select {
 					case out <- ChatDelta{Done: true}:
 					case <-ctx.Done():

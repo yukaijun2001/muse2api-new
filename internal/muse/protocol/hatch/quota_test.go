@@ -81,6 +81,7 @@ func TestActionIDFromChunk(t *testing.T) {
 func TestQueryQuotaRediscoversActionAfter409FromRootChunks(t *testing.T) {
 	const actionID = "0123456789abcdef0123456789abcdef01234567"
 	var postCount atomic.Int32
+	var fetchedSettings atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			postCount.Add(1)
@@ -114,13 +115,15 @@ func TestQueryQuotaRediscoversActionAfter409FromRootChunks(t *testing.T) {
 		switch r.URL.Path {
 		case "/":
 			w.Header().Set("Content-Type", "text/html")
-			_, _ = io.WriteString(w, `<html><script src="/_next/static/chunks/app-main.js"></script></html>`)
-		case "/settings":
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = io.WriteString(w, `<html><body>Settings shell</body></html>`)
-		case "/_next/static/chunks/app-main.js":
-			_, _ = io.WriteString(w, `const settings="static/chunks/settings~account.js";`)
+			_, _ = io.WriteString(w, `<html><script src="/_next/static/chunks/app.js"></script><script src="/_next/static/chunks/loader.js"></script></html>`)
+		case "/_next/static/chunks/app.js":
+			_, _ = io.WriteString(w, `e.A(434304).then(({preloadHatchSettingsData:e})=>e({}))`)
+		case "/_next/static/chunks/loader.js":
+			_, _ = io.WriteString(w, `},56115,s=>{s.v(t=>Promise.all(["static/chunks/unrelated.js"]))},434304,s=>{s.v(t=>Promise.all(["static/chunks/settings~account.js"].map(t=>s.l(t))))}`)
+		case "/_next/static/chunks/unrelated.js":
+			t.Error("unrelated chunk was fetched")
 		case "/_next/static/chunks/settings~account.js":
+			fetchedSettings.Add(1)
 			_, _ = io.WriteString(w, `createServerReference("`+actionID+`",g.callServer,void 0,g.findSourceMapURL,"fetchSubscriptionAction")`)
 		default:
 			http.NotFound(w, r)
@@ -145,6 +148,9 @@ func TestQueryQuotaRediscoversActionAfter409FromRootChunks(t *testing.T) {
 	}
 	if got := postCount.Load(); got != 2 {
 		t.Fatalf("action POST count = %d, want stale action plus rediscovered action", got)
+	}
+	if got := fetchedSettings.Load(); got != 1 {
+		t.Fatalf("settings chunks fetched = %d, want 1", got)
 	}
 }
 

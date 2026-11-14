@@ -59,14 +59,25 @@ func main() {
 		logger.Error("上游 HTTP 客户端初始化失败", "error", err)
 		os.Exit(1)
 	}
-	wsDialer := &websocket.Dialer{HandshakeTimeout: 20 * time.Second, Proxy: http.ProxyFromEnvironment}
+	var wsProxyURL *url.URL
 	if cfg.ProxyURL != "" {
 		proxyURL, proxyErr := url.Parse(cfg.ProxyURL)
 		if proxyErr != nil {
 			logger.Error("代理地址无效", "error", proxyErr)
 			os.Exit(1)
 		}
-		wsDialer.Proxy = http.ProxyURL(proxyURL)
+		wsProxyURL = proxyURL
+	} else {
+		proxyURL, proxyErr := http.ProxyFromEnvironment(&http.Request{URL: &url.URL{Scheme: "https", Host: hatch.DefaultLBHost}})
+		if proxyErr != nil {
+			logger.Error("WebSocket 代理配置无效", "error", proxyErr)
+			os.Exit(1)
+		}
+		wsProxyURL = proxyURL
+	}
+	wsDialer := &websocket.Dialer{
+		HandshakeTimeout:  20 * time.Second,
+		NetDialTLSContext: hatch.NewChromeWSDialer(wsProxyURL).DialContext,
 	}
 	driver := hatch.NewDriver(hatch.DriverConfig{
 		SiteURL:       site,
