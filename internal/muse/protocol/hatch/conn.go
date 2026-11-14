@@ -266,16 +266,52 @@ func Dial(ctx context.Context, wsURL string) (*Conn, error) {
 // DialWithDialer is the test/proxy seam. A nil dialer keeps the production
 // defaults.
 func DialWithDialer(ctx context.Context, wsURL string, dialer *websocket.Dialer) (*Conn, error) {
+	return DialWithHeader(ctx, wsURL, dialer, nil)
+}
+
+// GatewayDialError reports a WebSocket upgrade the gateway refused.
+type GatewayDialError struct {
+	StatusCode int
+	Status     string
+	Err        error
+}
+
+func (e *GatewayDialError) Error() string {
+	return fmt.Sprintf("gateway dial: %v (%s)", e.Err, e.Status)
+}
+
+func (e *GatewayDialError) Unwrap() error { return e.Err }
+
+// gatewayHeader is the handshake header set the web client sends. The gateway
+// validates the admission token first (401) and then rejects upgrades that do
+// not look like the web origin (403).
+func gatewayHeader(site *url.URL) http.Header {
+	origin := "https://muse.ai"
+	if site != nil && site.Host != "" {
+		origin = site.Scheme + "://" + site.Host
+	}
+	return http.Header{
+		"Origin":          {origin},
+		"User-Agent":      {chromeUserAgent},
+		"Accept-Language": {"en-US,en;q=0.9"},
+		"Cache-Control":   {"no-cache"},
+		"Pragma":          {"no-cache"},
+	}
+}
+
+// DialWithHeader opens the gateway with explicit handshake headers.
+func DialWithHeader(ctx context.Context, wsURL string, dialer *websocket.Dialer, header http.Header) (*Conn, error) {
 	if dialer == nil {
 		dialer = &websocket.Dialer{HandshakeTimeout: handshakeTimeout, ReadBufferSize: 1 << 20, WriteBufferSize: 1 << 20}
 	}
-	ws, resp, err := dialer.DialContext(ctx, wsURL, nil)
+	ws, resp, err := dialer.DialContext(ctx, wsURL, header)
 	if err != nil {
-		status := ""
+		dialErr := &GatewayDialError{Err: err}
 		if resp != nil {
-			status = resp.Status
+			dialErr.StatusCode = resp.StatusCode
+			dialErr.Status = resp.Status
 		}
-		return nil, fmt.Errorf("gateway dial: %w (%s)", err, status)
+		return nil, dialErr
 	}
 	ws.SetReadLimit(64 << 20)
 

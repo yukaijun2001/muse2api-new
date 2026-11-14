@@ -151,7 +151,18 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 	// Bootstrap can rotate hatch_sess/device cookies. Fingerprint the post-
 	// bootstrap set so the next turn does not reconnect on every request.
 	key = credentialFingerprint(session.Cookies)
-	conn, err := DialWithDialer(ctx, session.WSURL, c.dialer)
+	header := gatewayHeader(c.site)
+	conn, err := DialWithHeader(ctx, session.WSURL, c.dialer, header)
+	var dialErr *GatewayDialError
+	if err != nil && session.FallbackWSURL != "" && errors.As(err, &dialErr) &&
+		(dialErr.StatusCode == http.StatusUnauthorized || dialErr.StatusCode == http.StatusForbidden) {
+		// The early bootstrap token can be refused while the authoritative
+		// server-data token is accepted; try it once before giving up.
+		conn, err = DialWithHeader(ctx, session.FallbackWSURL, c.dialer, header)
+		if err != nil {
+			err = fmt.Errorf("%w; early bootstrap token: %v", err, dialErr)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

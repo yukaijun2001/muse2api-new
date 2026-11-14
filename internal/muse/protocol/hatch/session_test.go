@@ -102,6 +102,34 @@ func TestBootstrapReadsGatewayInitFromHomepage(t *testing.T) {
 	if query.Get("auth_token") != "hatch-token" || query.Get("app_version") != "1" || len(query.Get("request_id")) != 36 {
 		t.Fatalf("ws query = %v", query)
 	}
+	fallback, err := url.Parse(session.FallbackWSURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fallback.Query(); got.Get("auth_token") != "authoritative-token" || got.Get("notary_token") != "authoritative-notary" {
+		t.Fatalf("fallback ws query = %v", got)
+	}
+}
+
+func TestDialWithHeaderReportsRejectedUpgrade(t *testing.T) {
+	var origin, agent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin, agent = r.Header.Get("Origin"), r.Header.Get("User-Agent")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+	site, err := url.Parse("https://muse.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DialWithHeader(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil, gatewayHeader(site))
+	var dialErr *GatewayDialError
+	if !errors.As(err, &dialErr) || dialErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("err = %v, want GatewayDialError 403", err)
+	}
+	if origin != "https://muse.ai" || agent != chromeUserAgent {
+		t.Fatalf("handshake Origin=%q User-Agent=%q", origin, agent)
+	}
 }
 
 func TestBootstrapWakesStoppedVMUntilRunning(t *testing.T) {

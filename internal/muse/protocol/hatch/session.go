@@ -32,13 +32,17 @@ const (
 
 // Session is a bootstrapped gateway admission (VM + auth token).
 type Session struct {
-	VMID         string
-	Endpoint     string
-	AuthToken    string
-	Notary       string
-	WSURL        string
-	Cookies      map[string]string
-	CookieExpiry map[string]int64
+	VMID      string
+	Endpoint  string
+	AuthToken string
+	Notary    string
+	WSURL     string
+	// FallbackWSURL carries the authoritative server-data token when it
+	// differs from the early bootstrap token; it is tried once if the gateway
+	// refuses the first admission.
+	FallbackWSURL string
+	Cookies       map[string]string
+	CookieExpiry  map[string]int64
 }
 
 // SessionOptions carries the HTTP bootstrap inputs.
@@ -123,23 +127,31 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	}
 
 	wsURL := opts.WSURL
+	fallbackWSURL := ""
 	if wsURL == "" {
-		// Same parameter order as the web client.
-		params := []string{
-			"vm_id=" + url.QueryEscape(init.VMID),
-			"auth_token=" + url.QueryEscape(init.AuthToken),
+		wsURL = gatewayWSURL(lbHost, wsPath, appID, init.VMID, init.AuthToken, init.NotaryToken)
+		if init.AltAuthToken != "" && init.AltAuthToken != init.AuthToken {
+			fallbackWSURL = gatewayWSURL(lbHost, wsPath, appID, init.VMID, init.AltAuthToken, init.AltNotaryToken)
 		}
-		if init.NotaryToken != "" {
-			params = append(params, "notary_token="+url.QueryEscape(init.NotaryToken))
-		}
-		params = append(params,
-			"app_id="+url.QueryEscape(appID),
-			"app_version="+DefaultAppVersion,
-			"request_id="+randomUUID(),
-		)
-		wsURL = "wss://" + lbHost + wsPath + "?" + strings.Join(params, "&")
 	}
-	return &Session{VMID: init.VMID, Endpoint: init.GatewayURL, AuthToken: init.AuthToken, Notary: init.NotaryToken, WSURL: wsURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
+	return &Session{VMID: init.VMID, Endpoint: init.GatewayURL, AuthToken: init.AuthToken, Notary: init.NotaryToken, WSURL: wsURL, FallbackWSURL: fallbackWSURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
+}
+
+// gatewayWSURL builds the admission URL with the web client's parameter order.
+func gatewayWSURL(lbHost, wsPath, appID, vmID, authToken, notaryToken string) string {
+	params := []string{
+		"vm_id=" + url.QueryEscape(vmID),
+		"auth_token=" + url.QueryEscape(authToken),
+	}
+	if notaryToken != "" {
+		params = append(params, "notary_token="+url.QueryEscape(notaryToken))
+	}
+	params = append(params,
+		"app_id="+url.QueryEscape(appID),
+		"app_version="+DefaultAppVersion,
+		"request_id="+randomUUID(),
+	)
+	return "wss://" + lbHost + wsPath + "?" + strings.Join(params, "&")
 }
 
 // gatewayInit is the gateway bootstrap the signed-in homepage renders.
@@ -151,6 +163,10 @@ type gatewayInit struct {
 	VMState     string
 	Assignment  string
 	Issue       any
+
+	// AltAuthToken/AltNotaryToken come from the authoritative server data.
+	AltAuthToken   string
+	AltNotaryToken string
 }
 
 func (o *SessionOptions) loadGatewayInit(ctx context.Context) (*gatewayInit, error) {
@@ -230,6 +246,10 @@ func parseGatewayInit(page string) *gatewayInit {
 		if state := asString(obj["vmState"]); state != "" && rank(obj) < stateRank {
 			init.VMState = state
 			stateRank = rank(obj)
+		}
+		if rank(obj) == 1 && init.AltAuthToken == "" {
+			init.AltAuthToken = strings.TrimSpace(asString(obj["authToken"]))
+			init.AltNotaryToken = strings.TrimSpace(asString(obj["noiseNotaryToken"]))
 		}
 	}
 	return init

@@ -129,6 +129,9 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 		_, _ = io.WriteString(w, gatewayTestPage(t, "RUNNING", "assigned"))
 	})
 	mux.HandleFunc("/v1/noise", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") == "" || r.Header.Get("User-Agent") != chromeUserAgent {
+			t.Errorf("gateway handshake Origin=%q User-Agent=%q", r.Header.Get("Origin"), r.Header.Get("User-Agent"))
+		}
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
