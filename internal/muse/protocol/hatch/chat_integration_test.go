@@ -18,6 +18,10 @@ import (
 	"muse2api/internal/muse/protocol"
 )
 
+// gatewayImageItems holds the image attachments of the last chat.stream turn
+// the fake gateway received. Tests in this package do not run in parallel.
+var gatewayImageItems []map[string]any
+
 func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 	t.Helper()
 	var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -92,6 +96,12 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 					if items, ok := request["items"].([]any); ok && len(items) > 0 {
 						if item, ok := items[len(items)-1].(map[string]any); ok {
 							chatPrompt, _ = item["text"].(string)
+						}
+						gatewayImageItems = gatewayImageItems[:0]
+						for _, raw := range items[:len(items)-1] {
+							if item, ok := raw.(map[string]any); ok && item["type"] == "image" {
+								gatewayImageItems = append(gatewayImageItems, item)
+							}
 						}
 					}
 				}
@@ -198,6 +208,33 @@ func TestChatWithItemsHistoryAndMedia(t *testing.T) {
 	}
 	if text != "done" || len(media) != 1 || media[0].Path != "gen.png" {
 		t.Fatalf("text=%q media=%+v", text, media)
+	}
+}
+
+func TestChatWithItemsSendsReferenceImagesBeforePrompt(t *testing.T) {
+	server, wsURL := startChatGateway(t, true)
+	client := NewClientWithWSURL(mustURL(t, server.URL), server.Client(), wsURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	items, err := referenceItems([]string{
+		"data:image/png;base64,iVBORw0KGgo=",
+		"data:image/jpeg;base64,/9j/4AAQ",
+	}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.ChatWithItems(ctx, map[string]string{"hatch_sess": "s"}, "draw", items, true, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if len(gatewayImageItems) != 2 {
+		t.Fatalf("gateway image items = %d, want 2", len(gatewayImageItems))
+	}
+	first, second := gatewayImageItems[0], gatewayImageItems[1]
+	if first["mime_type"] != "image/png" || first["data_base64"] != "iVBORw0KGgo=" || first["filename"] != "reference.png" {
+		t.Fatalf("first item = %#v", first)
+	}
+	if second["mime_type"] != "image/jpeg" || second["filename"] != "reference.jpg" {
+		t.Fatalf("second item = %#v", second)
 	}
 }
 

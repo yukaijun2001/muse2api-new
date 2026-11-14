@@ -1047,7 +1047,29 @@ input[type="checkbox"] { width: 15px; height: 15px; margin: 0; accent-color: var
 .console-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 14px; border-top: 1px solid var(--console-line); background: var(--console-bg-2); color: var(--console-muted); font-size: 9px; }
 .console-foot .button { color: #b7b6c2; }
 .console-foot .button:hover { background: #1c1c24; color: #f0eff4; }
+.console-progress { height: 3px; margin: 10px 14px 0; overflow: hidden; border-radius: 2px; background: var(--console-line); }
+.console-progress span { display: block; height: 100%; background: var(--accent); transition: width .4s ease; }
+.console-media { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; margin: 12px 14px 0; }
+.console-media img, .console-media video { display: block; width: 100%; max-height: 360px; object-fit: contain; border: 1px solid var(--console-line); border-radius: 10px; background: var(--console-bg-2); }
+.console-media .button { color: #d7d6df; border-color: var(--console-line); background: transparent; }
+.console-media .button:hover { background: #1c1c24; color: #f0eff4; }
 .console-error { margin: 10px 14px 0; }
+
+/* reference image picker */
+.reference-picker { display: flex; flex-direction: column; gap: 7px; }
+.reference-picker-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.reference-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; padding: 8px; border: 1px dashed var(--line-strong); border-radius: var(--r-sm); background: var(--surface-2); transition: border-color .15s, background .15s; }
+.reference-grid.dragging { border-color: var(--accent); background: var(--accent-soft); }
+.reference-thumb { position: relative; margin: 0; aspect-ratio: 1; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.reference-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.reference-thumb figcaption { position: absolute; right: 0; bottom: 0; left: 0; padding: 3px 6px; background: linear-gradient(transparent, rgba(0, 0, 0, .55)); color: #fff; font-size: 9px; text-align: right; }
+.reference-index { position: absolute; top: 5px; left: 5px; display: grid; place-items: center; width: 17px; height: 17px; border-radius: 50%; background: rgba(0, 0, 0, .6); color: #fff; font-size: 9.5px; font-weight: 650; }
+.reference-remove { position: absolute; top: 4px; right: 4px; display: grid; place-items: center; width: 20px; height: 20px; border: 0; border-radius: 50%; background: rgba(0, 0, 0, .6); color: #fff; cursor: pointer; }
+.reference-remove:hover { background: var(--danger); }
+.reference-add { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; aspect-ratio: 1; padding: 6px; border: 1px dashed var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink-3); font-size: 10px; line-height: 1.35; text-align: center; cursor: pointer; }
+.reference-add:only-child { grid-column: 1 / -1; aspect-ratio: auto; min-height: 84px; flex-direction: row; gap: 8px; font-size: 11.5px; }
+.reference-add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.reference-add:disabled, .reference-remove:disabled { cursor: not-allowed; opacity: .55; }
 .console-error .inline-message { border-color: rgba(255, 127, 122, .22); background: rgba(255, 127, 122, .08); color: #ff9b95; }
 
 /* ───────────────────────── models ───────────────────────── */
