@@ -1,8 +1,16 @@
 package hatch
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"muse2api/internal/muse/protocol"
 )
 
 const quotaFlightSample = "0:{\"a\":\"$@1\",\"q\":\"\",\"i\":false}\n" +
@@ -67,5 +75,106 @@ func TestActionIDFromChunk(t *testing.T) {
 	}
 	if id := actionIDFromChunk("no action here"); id != "" {
 		t.Fatalf("unexpected id %q", id)
+	}
+}
+
+func TestQueryQuotaRediscoversActionAfter409FromRootChunks(t *testing.T) {
+	const actionID = "0123456789abcdef0123456789abcdef01234567"
+	var postCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postCount.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read action body: %v", err)
+			}
+			if r.URL.Path != "/" {
+				http.Error(w, "Server Action unavailable.", http.StatusConflict)
+				return
+			}
+			if got := r.Header.Get("Content-Type"); got != "text/plain;charset=UTF-8" {
+				t.Errorf("Content-Type = %q", got)
+			}
+			if got := r.Header.Get("Next-Action"); got == actionID {
+				if string(body) != `[{"includeAgreement":true}]` {
+					t.Errorf("action body = %q", body)
+				}
+				w.Header().Set("Content-Type", "text/x-component")
+				_, _ = io.WriteString(w, quotaFlightSample)
+				return
+			}
+			http.Error(w, "Server Action unavailable.", http.StatusConflict)
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<html><script src="/_next/static/chunks/app-main.js"></script></html>`)
+		case "/settings":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<html><body>Settings shell</body></html>`)
+		case "/_next/static/chunks/app-main.js":
+			_, _ = io.WriteString(w, `const settings="static/chunks/settings~account.js";`)
+		case "/_next/static/chunks/settings~account.js":
+			_, _ = io.WriteString(w, `createServerReference("`+actionID+`",g.callServer,void 0,g.findSourceMapURL,"fetchSubscriptionAction")`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	site, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	client := NewClientWithWSURL(site, server.Client(), "")
+	quota, err := client.QueryQuota(context.Background(), protocol.AccountCredentials{
+		ID:      "account-1",
+		Cookies: map[string]string{"hatch_sess": "test-session"},
+	})
+	if err != nil {
+		t.Fatalf("QueryQuota: %v", err)
+	}
+	if quota.Plan != "Muse 免费版" || quota.WeeklyUsedPct != 16 {
+		t.Fatalf("unexpected quota: %+v", quota)
+	}
+	if got := postCount.Load(); got != 2 {
+		t.Fatalf("action POST count = %d, want stale action plus rediscovered action", got)
+	}
+}
+
+func TestQueryQuotaDoesNotRediscoverAfterRateLimitOrServerError(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var getCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					getCount.Add(1)
+				}
+				http.Error(w, http.StatusText(status), status)
+			}))
+			defer server.Close()
+
+			site, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatalf("parse server URL: %v", err)
+			}
+			client := NewClientWithWSURL(site, server.Client(), "")
+			_, err = client.QueryQuota(context.Background(), protocol.AccountCredentials{
+				ID:      "account-1",
+				Cookies: map[string]string{"hatch_sess": "test-session"},
+			})
+			if err == nil {
+				t.Fatal("QueryQuota unexpectedly succeeded")
+			}
+			if got := getCount.Load(); got != 0 {
+				t.Fatalf("homepage discovery GET count = %d, want 0", got)
+			}
+		})
 	}
 }

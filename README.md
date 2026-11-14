@@ -354,12 +354,12 @@ WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&app_i
 应用层:         /api/nodes/register → /client/register-capabilities
                 POST /chat/subscribe（增量）→ POST /chat/stream → GET /chat/history
                 媒体从 /media/raw 或 /fs/raw 下载
-额度:           POST /settings（Next-Action: fetchSubscriptionAction，React Flight 响应）
+额度:           POST /（Next-Action: fetchSubscriptionAction，React Flight 响应）
 ```
 
 已用真实账号验收：文生图、参考图编辑、多图参考、参考图视频、文生视频、混合并发都能完成，媒体正常落盘；对话按上游 `chat.subscribe` 的增量逐字转发为 SSE；视频结果的时长和分辨率从 MP4 元数据解析。
 
-额度刷新也走纯 HTTP：Muse 的设置页通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化，失效时自动扫描设置页加载的脚本重新定位并缓存。
+额度刷新也走纯 HTTP：Muse 的首页应用通过 Next.js server action `fetchSubscriptionAction` 返回订阅快照（套餐、每周用量、额外额度），后台只发一次 POST，不唤醒 VM、不启动浏览器。action id 会随部署变化；遇到 Muse 返回的客户端错误时，会扫描首页引用的脚本和懒加载模块，重新定位 action 并重试一次，成功后缓存新标识。认证失败和限流不会触发脚本扫描。
 
 ### 账号连接与保活
 

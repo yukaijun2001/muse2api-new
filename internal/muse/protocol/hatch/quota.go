@@ -24,7 +24,7 @@ import (
 const (
 	quotaActionName     = "fetchSubscriptionAction"
 	quotaFallbackAction = "409b972cbb33d3e372f4ca9d3c8332677217064f62"
-	quotaPagePath       = "/settings"
+	quotaPagePath       = "/"
 	quotaActionTTL      = 12 * time.Hour
 	quotaScanWorkers    = 12
 	quotaScanLimit      = 512
@@ -34,8 +34,8 @@ const (
 
 var (
 	actionHexRe  = regexp.MustCompile(`[0-9a-f]{40,}`)
-	chunkURLRe   = regexp.MustCompile(`(/_next/static/chunks/[A-Za-z0-9_-]+\.js[^"'\s]*)`)
-	chunkNameRe  = regexp.MustCompile(`static/chunks/([A-Za-z0-9_-]+\.js)`)
+	chunkURLRe   = regexp.MustCompile(`(/_next/static/chunks/[A-Za-z0-9_~.-]+\.js[^"'\s]*)`)
+	chunkNameRe  = regexp.MustCompile(`static/chunks/([A-Za-z0-9_~.-]+\.js)`)
 	dplRe        = regexp.MustCompile(`dpl_[A-Za-z0-9]+`)
 	loginMarkers = []string{"sign in", "log in", "login", "登录", "signin"}
 )
@@ -72,9 +72,12 @@ func (c *Client) QueryQuota(ctx context.Context, creds protocol.AccountCredentia
 	if errors.Is(err, protocol.ErrSessionExpired) {
 		return nil, err
 	}
+	if !quotaActionNeedsRediscovery(err) {
+		return nil, err
+	}
 
 	// The cached/fallback id was rejected (new deployment). Rebuild it from
-	// the chunks the settings page loads and retry once.
+	// the chunks the homepage loads and retry once.
 	discovered, discoverErr := c.discoverQuotaAction(ctx, creds.Cookies)
 	if discoverErr != nil {
 		return nil, fmt.Errorf("额度接口定位失败：%v（首次原因：%v）", discoverErr, err)
@@ -85,6 +88,23 @@ func (c *Client) QueryQuota(ctx context.Context, creds protocol.AccountCredentia
 	}
 	c.rememberQuotaAction(discovered)
 	return quotaFromSubscription(subscription)
+}
+
+func quotaActionNeedsRediscovery(err error) bool {
+	var actionErr *quotaActionHTTPError
+	if !errors.As(err, &actionErr) {
+		return false
+	}
+	return actionErr.status >= 400 && actionErr.status < 500 && actionErr.status != http.StatusTooManyRequests
+}
+
+type quotaActionHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *quotaActionHTTPError) Error() string {
+	return fmt.Sprintf("额度接口 HTTP %d: %s", e.status, e.body)
 }
 
 func (c *Client) cachedQuotaAction() string {
@@ -113,7 +133,7 @@ func (c *Client) callQuotaAction(ctx context.Context, cookies map[string]string,
 	}
 	base := strings.TrimRight(c.site.String(), "/")
 	endpoint := base + quotaPagePath
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("[]"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(`[{"includeAgreement":true}]`))
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +162,7 @@ func (c *Client) callQuotaAction(ctx context.Context, cookies map[string]string,
 		return nil, protocol.ErrSessionExpired
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("额度接口 HTTP %d: %s", resp.StatusCode, truncate(body, 160))
+		return nil, &quotaActionHTTPError{status: resp.StatusCode, body: truncate(body, 160)}
 	}
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "text/x-component") {
@@ -253,9 +273,9 @@ func looksLikeLoginPage(body []byte) bool {
 	return false
 }
 
-// discoverQuotaAction scans the deployed settings chunks for the server-action
-// reference. Pass one covers the first-screen scripts; the loader tables found
-// there name the lazily loaded chunks that pass two downloads.
+// discoverQuotaAction scans the homepage chunks for the server-action
+// reference. The settings page is lazy-loaded, so its chunk names are found in
+// the homepage loader scripts and downloaded in a second pass.
 func (c *Client) discoverQuotaAction(ctx context.Context, cookies map[string]string) (string, error) {
 	base := strings.TrimRight(c.site.String(), "/")
 	html, err := c.fetchText(ctx, cookies, base+quotaPagePath, quotaBodyMaxBytes)
@@ -273,7 +293,10 @@ func (c *Client) discoverQuotaAction(ctx context.Context, cookies map[string]str
 		firstScreen[url] = struct{}{}
 	}
 	if len(firstScreen) == 0 {
-		return "", errors.New("设置页没有引用任何脚本")
+		if looksLikeLoginPage([]byte(html)) {
+			return "", protocol.ErrSessionExpired
+		}
+		return "", errors.New("首页没有引用任何可识别的 Next.js 脚本")
 	}
 	urls := make([]string, 0, len(firstScreen))
 	for url := range firstScreen {
