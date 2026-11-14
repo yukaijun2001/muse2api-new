@@ -154,6 +154,77 @@ func TestQueryQuotaRediscoversActionAfter409FromRootChunks(t *testing.T) {
 	}
 }
 
+func TestQueryQuotaRediscoversActionFromImmutableChunks(t *testing.T) {
+	const actionID = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct {
+		name   string
+		app    string
+		loader string
+	}{
+		{
+			name:   "settings module",
+			app:    `e.A(434304).then(({preloadHatchSettingsData:e})=>e({}))`,
+			loader: `},56115,s=>{s.v(t=>Promise.all(["static/immutable/chunks/unrelated.js"]))},434304,s=>{s.v(t=>Promise.all(["static/immutable/chunks/settings~account.js"].map(t=>s.l(t))))}`,
+		},
+		{
+			name:   "renamed settings module",
+			app:    `e.A(434304).then(({preloadAccountPanel:e})=>e({}))`,
+			loader: `},434304,s=>{s.v(t=>Promise.all(["static/immutable/chunks/settings~account.js"].map(t=>s.l(t))))}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fetchedSettings atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					if r.Header.Get("Next-Action") == actionID {
+						w.Header().Set("Content-Type", "text/x-component")
+						_, _ = io.WriteString(w, quotaFlightSample)
+						return
+					}
+					http.Error(w, "Server Action unavailable.", http.StatusConflict)
+					return
+				}
+				switch r.URL.Path {
+				case "/":
+					w.Header().Set("Content-Type", "text/html")
+					_, _ = io.WriteString(w, `<html data-dpl-id="dpl_abc"><script src="/_next/static/immutable/chunks/app.js" async=""></script><script>self.__next_f.push([1,"2:I[1,[\"/_next/static/immutable/chunks/loader.js\"]]"])</script></html>`)
+				case "/_next/static/immutable/chunks/app.js":
+					_, _ = io.WriteString(w, tc.app)
+				case "/_next/static/immutable/chunks/loader.js":
+					_, _ = io.WriteString(w, tc.loader)
+				case "/_next/static/immutable/chunks/unrelated.js":
+					t.Error("unrelated chunk was fetched")
+				case "/_next/static/immutable/chunks/settings~account.js":
+					fetchedSettings.Add(1)
+					_, _ = io.WriteString(w, `createServerReference)("`+actionID+`",g.callServer,void 0,g.findSourceMapURL,"fetchSubscriptionAction")`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			site, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatalf("parse server URL: %v", err)
+			}
+			client := NewClientWithWSURL(site, server.Client(), "")
+			quota, err := client.QueryQuota(context.Background(), protocol.AccountCredentials{
+				ID:      "account-1",
+				Cookies: map[string]string{"hatch_sess": "test-session"},
+			})
+			if err != nil {
+				t.Fatalf("QueryQuota: %v", err)
+			}
+			if quota.Plan != "Muse 免费版" {
+				t.Fatalf("unexpected quota: %+v", quota)
+			}
+			if got := fetchedSettings.Load(); got != 1 {
+				t.Fatalf("settings chunks fetched = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestQueryQuotaDoesNotRediscoverAfterRateLimitOrServerError(t *testing.T) {
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

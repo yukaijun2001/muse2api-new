@@ -30,13 +30,16 @@ const (
 	quotaScanWorkers    = 12
 	quotaPageChunkLimit = 96
 	quotaSettingsLimit  = 32
+	quotaLazyChunkLimit = 400
 	quotaChunkMaxBytes  = 2 << 20
 	quotaBodyMaxBytes   = 4 << 20
 )
 
+// Chunk paths are matched with their directory prefix kept: older deployments
+// serve them from static/chunks/, newer ones from static/immutable/chunks/.
 var (
-	chunkURLRe       = regexp.MustCompile(`(/_next/static/chunks/[A-Za-z0-9_~.-]+\.js[^"'\s]*)`)
-	chunkNameRe      = regexp.MustCompile(`static/chunks/([A-Za-z0-9_~.-]+\.js)`)
+	chunkURLRe       = regexp.MustCompile(`(/_next/static/(?:immutable/)?chunks/[A-Za-z0-9_~./-]+\.js[^"'\s\\]*)`)
+	chunkNameRe      = regexp.MustCompile(`(static/(?:immutable/)?chunks/[A-Za-z0-9_~./-]+\.js)`)
 	settingsModuleRe = regexp.MustCompile(`\.A\((\d+)\)\.then\(\(\{[^}]*Settings`)
 	actionRefRe      = regexp.MustCompile(`"([0-9a-f]{40,})",[^)]{0,400}"fetchSubscriptionAction"`)
 	dplRe            = regexp.MustCompile(`dpl_[A-Za-z0-9]+`)
@@ -313,42 +316,82 @@ func (c *Client) discoverQuotaAction(ctx context.Context, cookies map[string]str
 		return id, nil
 	}
 
+	settingsURLs, settingsErr := settingsChunkURLs(firstScreenText, base, dpl)
+	fetched := make(map[string]struct{}, len(urls)+len(settingsURLs))
+	for _, url := range urls {
+		fetched[url] = struct{}{}
+	}
+	if settingsErr == nil {
+		if id := actionIDFromChunk(c.fetchChunks(ctx, cookies, settingsURLs)); id != "" {
+			return id, nil
+		}
+		settingsErr = errors.New("设置脚本中没有找到额度接口标识")
+		for _, url := range settingsURLs {
+			fetched[url] = struct{}{}
+		}
+	}
+
+	// The settings module is located by name, which a deployment can rename.
+	// Fall back to every lazily loaded chunk the homepage can reach.
+	lazyURLs := chunkURLsFromNames(chunkNameRe.FindAllStringSubmatch(firstScreenText, -1), base, dpl, fetched)
+	if len(lazyURLs) > quotaLazyChunkLimit {
+		lazyURLs = lazyURLs[:quotaLazyChunkLimit]
+	}
+	if len(lazyURLs) > 0 {
+		if id := actionIDFromChunk(c.fetchChunks(ctx, cookies, lazyURLs)); id != "" {
+			return id, nil
+		}
+	}
+	return "", settingsErr
+}
+
+// settingsChunkURLs resolves the chunks behind the settings module's lazy
+// loader entry in the homepage's module table.
+func settingsChunkURLs(firstScreenText, base, dpl string) ([]string, error) {
 	module := settingsModuleRe.FindStringSubmatch(firstScreenText)
 	if len(module) < 2 {
-		return "", errors.New("首页应用中没有找到设置模块")
+		return nil, errors.New("首页应用中没有找到设置模块")
 	}
 	loaderRe, err := regexp.Compile(`(?:^|[,{\[])` + regexp.QuoteMeta(module[1]) + `,\w+=>\{\w+\.v\(\w+=>Promise\.all\(\[([^\]]*)`)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	loader := loaderRe.FindStringSubmatch(firstScreenText)
 	if len(loader) < 2 {
-		return "", errors.New("首页应用中没有找到设置模块加载表")
+		return nil, errors.New("首页应用中没有找到设置模块加载表")
 	}
-
-	settingsNames := map[string]struct{}{}
-	for _, match := range chunkNameRe.FindAllStringSubmatch(loader[1], -1) {
-		settingsNames[match[1]] = struct{}{}
-	}
-	settingsURLs := make([]string, 0, len(settingsNames))
-	for name := range settingsNames {
-		url := base + "/_next/static/chunks/" + name
-		if dpl != "" {
-			url += "?dpl=" + dpl
-		}
-		settingsURLs = append(settingsURLs, url)
-	}
-	sort.Strings(settingsURLs)
+	settingsURLs := chunkURLsFromNames(chunkNameRe.FindAllStringSubmatch(loader[1], -1), base, dpl, nil)
 	if len(settingsURLs) == 0 {
-		return "", errors.New("设置模块加载表没有引用脚本")
+		return nil, errors.New("设置模块加载表没有引用脚本")
 	}
 	if len(settingsURLs) > quotaSettingsLimit {
 		settingsURLs = settingsURLs[:quotaSettingsLimit]
 	}
-	if id := actionIDFromChunk(c.fetchChunks(ctx, cookies, settingsURLs)); id != "" {
-		return id, nil
+	return settingsURLs, nil
+}
+
+func chunkURLsFromNames(matches [][]string, base, dpl string, skip map[string]struct{}) []string {
+	seen := map[string]struct{}{}
+	urls := make([]string, 0, len(matches))
+	for _, match := range matches {
+		url := base + "/_next/" + match[1]
+		if dpl != "" {
+			url += "?dpl=" + dpl
+		}
+		if _, ok := seen[url]; ok {
+			continue
+		}
+		seen[url] = struct{}{}
+		if _, ok := skip[url]; ok {
+			continue
+		}
+		if _, ok := skip[base+"/_next/"+match[1]]; ok {
+			continue
+		}
+		urls = append(urls, url)
 	}
-	return "", errors.New("设置脚本中没有找到额度接口标识")
+	sort.Strings(urls)
+	return urls
 }
 
 func (c *Client) fetchChunks(ctx context.Context, cookies map[string]string, urls []string) string {
