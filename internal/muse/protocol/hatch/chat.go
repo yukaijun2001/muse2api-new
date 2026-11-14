@@ -87,6 +87,8 @@ type Client struct {
 	dialer     *websocket.Dialer
 	httpClient *http.Client
 	nodeID     string
+	// proxy is the account egress proxy this client's transport was built for.
+	proxy string
 
 	// quotaActionID caches the Next.js server-action id that returns the
 	// subscription snapshot. The id is build-specific, so it is re-discovered
@@ -154,13 +156,17 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 	header := gatewayHeader(c.site)
 	conn, err := DialWithHeader(ctx, session.WSURL, c.dialer, header)
 	var dialErr *GatewayDialError
-	if err != nil && session.FallbackWSURL != "" && errors.As(err, &dialErr) &&
+	if err != nil && errors.As(err, &dialErr) &&
 		(dialErr.StatusCode == http.StatusUnauthorized || dialErr.StatusCode == http.StatusForbidden) {
-		// The early bootstrap token can be refused while the authoritative
-		// server-data token is accepted; try it once before giving up.
-		conn, err = DialWithHeader(ctx, session.FallbackWSURL, c.dialer, header)
-		if err != nil {
-			err = fmt.Errorf("%w; early bootstrap token: %v", err, dialErr)
+		if session.FallbackWSURL == "" {
+			err = fmt.Errorf("%w [homepage offered a single gateway token]", err)
+		} else {
+			// The early bootstrap token can be refused while the authoritative
+			// server-data token is accepted; try it once before giving up.
+			conn, err = DialWithHeader(ctx, session.FallbackWSURL, c.dialer, header)
+			if err != nil {
+				err = fmt.Errorf("authoritative token: %w; early bootstrap token: %v", err, dialErr)
+			}
 		}
 	}
 	if err != nil {

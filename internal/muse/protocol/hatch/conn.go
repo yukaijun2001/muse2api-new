@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -273,11 +276,44 @@ func DialWithDialer(ctx context.Context, wsURL string, dialer *websocket.Dialer)
 type GatewayDialError struct {
 	StatusCode int
 	Status     string
-	Err        error
+	// Detail summarizes why the gateway refused: the response body and the
+	// gateway's own diagnostic headers. Token values never appear here.
+	Detail string
+	Err    error
 }
 
 func (e *GatewayDialError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("gateway dial: %v (%s; %s)", e.Err, e.Status, e.Detail)
+	}
 	return fmt.Sprintf("gateway dial: %v (%s)", e.Err, e.Status)
+}
+
+// gatewayRejectDetail keeps the parts of a refused upgrade that explain it:
+// the body, the error class from Proxy-Status (without its opaque e_*
+// parameters) and any X-Hatch-* header except the region hint.
+func gatewayRejectDetail(resp *http.Response) string {
+	var parts []string
+	if resp.Body != nil {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if text := strings.TrimSpace(string(body)); text != "" {
+			parts = append(parts, "body="+truncate([]byte(text), 200))
+		}
+	}
+	if status := resp.Header.Get("Proxy-Status"); status != "" {
+		parts = append(parts, "proxy-status="+strings.TrimSpace(strings.SplitN(status, ";", 2)[0]))
+	}
+	var names []string
+	for name := range resp.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-hatch-") && !strings.EqualFold(name, "X-Hatch-Region-Hint") {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		parts = append(parts, strings.ToLower(name)+"="+truncate([]byte(resp.Header.Get(name)), 120))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (e *GatewayDialError) Unwrap() error { return e.Err }
@@ -310,6 +346,7 @@ func DialWithHeader(ctx context.Context, wsURL string, dialer *websocket.Dialer,
 		if resp != nil {
 			dialErr.StatusCode = resp.StatusCode
 			dialErr.Status = resp.Status
+			dialErr.Detail = gatewayRejectDetail(resp)
 		}
 		return nil, dialErr
 	}

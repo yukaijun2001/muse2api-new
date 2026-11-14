@@ -506,3 +506,33 @@ func TestStoreScaleTenAccountsThousandTasks(t *testing.T) {
 		t.Fatalf("unexpected counts: %+v", counts)
 	}
 }
+
+func TestAccountProxyIsEncryptedWithCredentials(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openTest(t, dir, testKey(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.AddAccountWithProxy("p", map[string]string{"hatch_sess": "s", "hatch_vml": "v"}, nil, "http://user:proxy-secret@10.0.0.2:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Proxy != "" || a.ProxyLabel != "http://10.0.0.2:8080" {
+		t.Fatalf("add response proxy=%q label=%q", a.Proxy, a.ProxyLabel)
+	}
+	s2, err := openTest(t, dir, testKey(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s2.GetAccount(a.ID)
+	if err != nil || got.Proxy != "http://user:proxy-secret@10.0.0.2:8080" {
+		t.Fatalf("round trip proxy = %q, %v", got.Proxy, err)
+	}
+	if list := s2.ListAccounts(); len(list) != 1 || list[0].ProxyLabel != "http://10.0.0.2:8080" || list[0].Proxy != "" {
+		t.Fatalf("list proxy = %+v", list)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "muse2api.db"))
+	if contains(string(b), "proxy-secret") {
+		t.Fatal("plaintext proxy credential persisted")
+	}
+}

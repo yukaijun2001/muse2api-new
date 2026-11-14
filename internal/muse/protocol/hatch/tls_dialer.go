@@ -38,6 +38,27 @@ type chromeTLSDialer struct {
 	netDialer *net.Dialer
 	proxyURL  *url.URL
 	roots     *x509.CertPool
+	ipFamily  string
+}
+
+// SetIPFamily pins the TCP connection to IPv4 ("4") or IPv6 ("6"); anything
+// else keeps Go's dual-stack behavior.
+func (d *chromeTLSDialer) SetIPFamily(family string) { d.ipFamily = family }
+
+// PinNetwork maps "tcp" to "tcp4"/"tcp6" for an IP family setting. The
+// gateway token is bound to the egress address that fetched it, so the
+// homepage fetch and the gateway dial must leave through the same family.
+func PinNetwork(network, family string) string {
+	if network != "tcp" {
+		return network
+	}
+	switch family {
+	case "4":
+		return "tcp4"
+	case "6":
+		return "tcp6"
+	}
+	return network
 }
 
 func (d *chromeTLSDialer) Dial(network, address string) (net.Conn, error) {
@@ -85,6 +106,7 @@ func (d *chromeTLSDialer) DialContext(ctx context.Context, network, address stri
 }
 
 func (d *chromeTLSDialer) dialRaw(ctx context.Context, network, address string) (net.Conn, error) {
+	network = PinNetwork(network, d.ipFamily)
 	if d.proxyURL == nil {
 		return d.netDialer.DialContext(ctx, network, address)
 	}

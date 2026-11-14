@@ -203,6 +203,16 @@ MUSE2API_PUBLIC_BASE=https://api.example.com
 
 导入成功后后台会自动检测会话、刷新额度，列表会轮询状态；批量导入按队列一个一个处理，不用再手动点“检测”和“刷新额度”。
 
+### 账号出口代理
+
+Muse 的网关令牌和“拿到它的出口 IP”绑定：服务端先用 Cookie 打开 muse.ai 首页拿令牌，再去连 `hatch.metaaivm.com`，两次出口 IP 不同网关就回 403。所以：
+
+- 导入时可以给账号填“出口代理”（`http`、`https`、`socks5`、`socks5h`，可带用户名密码），这个账号的首页、网关、额度、检测请求全部走它；不同账号可以绑不同 IP。代理地址和 Cookie 一起加密存储，后台只显示 `scheme://host:port`。
+- 已有账号在“编辑”里改代理，改完旧连接立即作废，下个任务按新出口重新引导。
+- 批量导入时每行可以在末尾追加一列代理：`标签|hatch_sess=…; hatch_vml=…|socks5://user:pass@1.2.3.4:1080`；不写就用表单里填的默认代理，都没有就走全局 `MUSE2API_PROXY`。
+- 代理本身要是固定出口：按域名分流的代理（如 Clash 规则）可能把 `muse.ai` 和 `metaaivm.com` 分到不同节点，同样会 403。
+- 不用代理的双栈服务器默认只走 IPv4（`MUSE2API_IP_FAMILY=4`），避免一边走 IPv6 一边走 IPv4。
+
 不想手动抄 Cookie，可以用仓库自带的浏览器插件：Chrome / Edge 扩展页开开发者模式，加载 `browser-extension/` 目录，登录 muse.ai 后点扩展图标，就能复制 Cookie Header 或 JSON。也可以从 [GitHub Releases](https://github.com/vip0014/muse2api/releases) 下载最新 ZIP，解压后加载。详细说明在 [browser-extension/README.md](browser-extension/README.md)。
 
 ## 🔌 接口怎么调
@@ -333,7 +343,8 @@ curl http://127.0.0.1:18610/v1/videos \
 | `MUSE2API_CHAT_CONCURRENCY` | `0` | 对话类别上限；`0` 表示沿用 `MUSE2API_CONCURRENCY` |
 | `MUSE2API_IMAGE_CONCURRENCY` | `0` | 图片类别上限；`0` 表示沿用全局上限 |
 | `MUSE2API_VIDEO_CONCURRENCY` | `1` | 视频类别上限；视频很慢，默认只占一个槽位，避免饿死对话 |
-| `MUSE2API_PROXY` | 空 | 上游 HTTP/WS bootstrap、媒体下载和额度请求使用的代理 URL；也可用 `_FILE` |
+| `MUSE2API_PROXY` | 空 | 上游 HTTP/WS bootstrap、媒体下载和额度请求使用的代理 URL；也可用 `_FILE`。账号单独绑定的出口代理优先 |
+| `MUSE2API_IP_FAMILY` | `4` | 上游连接使用的地址族：`4` 只走 IPv4，`6` 只走 IPv6，`auto` 由系统决定。网关令牌绑定出口 IP，双栈机器不要用 `auto` |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 设为 `1` 才允许参考图读取服务器本地文件路径 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 设为 `1` 才允许参考图下载私网/本机 URL；默认只允许公网并逐跳检查重定向 |
 | `MUSE2API_KEEPALIVE_INTERVAL_HOURS` | `6` | 账号保活间隔（小时）；`0` 关闭。只发 `/api/session`，不唤醒 VM、不生成内容 |

@@ -643,3 +643,43 @@ func TestMapDriverErrorKeepsRedactedReason(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountProxyIsBoundMaskedAndEditable(t *testing.T) {
+	s, h := testServer(t, &fakeDriver{})
+	cookie := adminLogin(t, h)
+	rec := adminRequest(h, "POST", "/admin/accounts", `{"label":"p","cookie_header":"hatch_sess=s; hatch_vml=v","proxy":"http://user:proxy-secret@10.0.0.2:8080"}`, cookie)
+	if rec.Code != 201 || strings.Contains(rec.Body.String(), "proxy-secret") || !strings.Contains(rec.Body.String(), `"proxy":"http://10.0.0.2:8080"`) {
+		t.Fatalf("import with proxy: %d %s", rec.Code, rec.Body.String())
+	}
+	var added struct {
+		Added []model.Account `json:"added"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &added); err != nil || len(added.Added) != 1 {
+		t.Fatalf("decode import: %v %s", err, rec.Body.String())
+	}
+	id := added.Added[0].ID
+	stored, err := s.store.GetAccount(id)
+	if err != nil || stored.Proxy != "http://user:proxy-secret@10.0.0.2:8080" {
+		t.Fatalf("stored proxy = %q, %v", stored.Proxy, err)
+	}
+	list := adminRequest(h, "GET", "/admin/accounts", "", cookie)
+	if strings.Contains(list.Body.String(), "proxy-secret") || !strings.Contains(list.Body.String(), `"proxy":"http://10.0.0.2:8080"`) {
+		t.Fatalf("list proxy: %s", list.Body.String())
+	}
+
+	if rec := adminRequest(h, "PATCH", "/admin/accounts/"+id, `{"proxy":"ftp://10.0.0.3"}`, cookie); rec.Code != 400 {
+		t.Fatalf("invalid proxy accepted: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := adminRequest(h, "PATCH", "/admin/accounts/"+id, `{"proxy":"socks5://10.0.0.3:1080"}`, cookie); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"proxy":"socks5://10.0.0.3:1080"`) {
+		t.Fatalf("patch proxy: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := adminRequest(h, "PATCH", "/admin/accounts/"+id, `{"proxy":""}`, cookie); rec.Code != 200 || strings.Contains(rec.Body.String(), `"proxy"`) {
+		t.Fatalf("clear proxy: %d %s", rec.Code, rec.Body.String())
+	}
+
+	batch := `{"batch":"a|hatch_sess=s1; hatch_vml=v1|socks5h://10.0.0.4:1080\nhatch_sess=s2; hatch_vml=v2","proxy":"http://10.0.0.5:3128"}`
+	rec = adminRequest(h, "POST", "/admin/accounts", batch, cookie)
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"proxy":"socks5h://10.0.0.4:1080"`) || !strings.Contains(rec.Body.String(), `"proxy":"http://10.0.0.5:3128"`) {
+		t.Fatalf("batch proxies: %d %s", rec.Code, rec.Body.String())
+	}
+}

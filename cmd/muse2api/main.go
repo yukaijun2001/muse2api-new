@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -75,9 +76,11 @@ func main() {
 		}
 		wsProxyURL = proxyURL
 	}
+	chromeDialer := hatch.NewChromeWSDialer(wsProxyURL)
+	chromeDialer.SetIPFamily(cfg.IPFamily)
 	wsDialer := &websocket.Dialer{
 		HandshakeTimeout:  20 * time.Second,
-		NetDialTLSContext: hatch.NewChromeWSDialer(wsProxyURL).DialContext,
+		NetDialTLSContext: chromeDialer.DialContext,
 	}
 	driver := hatch.NewDriver(hatch.DriverConfig{
 		SiteURL:       site,
@@ -89,6 +92,7 @@ func main() {
 		VideoTimeout:  cfg.VideoTimeout,
 		MaxMediaBytes: cfg.MaxMediaBytes,
 		HTTPClient:    httpClient,
+		IPFamily:      cfg.IPFamily,
 	}, store)
 	generationProtocol := "hatch-noise-protocol"
 	app := server.New(cfg, store, driver, logger)
@@ -109,7 +113,7 @@ func main() {
 			}
 		}
 	}()
-	logger.Info("Muse2API 已启动", "address", cfg.Address(), "version", "2.1.0", "generation_protocol", generationProtocol)
+	logger.Info("Muse2API 已启动", "address", cfg.Address(), "version", "2.1.0", "generation_protocol", generationProtocol, "ip_family", cfg.IPFamily)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("服务退出", "error", err)
 		os.Exit(1)
@@ -130,6 +134,12 @@ func upstreamHTTPClient(cfg config.Config) (*http.Client, error) {
 		return &http.Client{Timeout: 30 * time.Second}, nil
 	}
 	cloned := transport.Clone()
+	// Same address family as the gateway dialer: muse.ai issues the gateway
+	// token for the address that fetched the homepage.
+	netDialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	cloned.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return netDialer.DialContext(ctx, hatch.PinNetwork(network, cfg.IPFamily), address)
+	}
 	if cfg.ProxyURL != "" {
 		proxyURL, err := url.Parse(cfg.ProxyURL)
 		if err != nil {

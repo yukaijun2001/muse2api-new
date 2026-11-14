@@ -6,6 +6,8 @@ export interface Account {
   label: string
   cookie_count: number
   essential_ok: boolean
+  /** Masked egress proxy (scheme://host:port); absent when the global proxy is used. */
+  proxy?: string
   status: AccountStatus
   enabled: boolean
   created_at: number

@@ -2,10 +2,12 @@ package hatch
 
 import (
 	"errors"
+	"net/http"
 	"net/url"
 	"testing"
 
 	"muse2api/internal/model"
+	"muse2api/internal/muse/protocol"
 )
 
 var errAccountNotFound = errors.New("account not found")
@@ -67,18 +69,48 @@ func (s *stubStore) UpdateAccount(id string, mutate func(*model.Account) error) 
 
 func TestDriverClientIsolation(t *testing.T) {
 	driver := NewDriver(DriverConfig{SiteURL: mustSiteURL(t)}, &stubStore{accounts: map[string]model.Account{}})
-	first := driver.clientFor("account-a")
+	accountA := protocol.AccountCredentials{ID: "account-a"}
+	first := driver.clientFor(accountA)
 	if first == nil {
 		t.Fatal("nil client")
 	}
-	if driver.clientFor("account-a") != first {
+	if driver.clientFor(accountA) != first {
 		t.Fatal("same account got a different client")
 	}
-	if driver.clientFor("account-b") == first {
+	if driver.clientFor(protocol.AccountCredentials{ID: "account-b"}) == first {
 		t.Fatal("different accounts shared one client")
 	}
 	driver.Close()
 	if len(driver.clients) != 0 {
 		t.Fatalf("clients not cleared: %d", len(driver.clients))
 	}
+}
+
+func TestDriverClientFollowsAccountProxy(t *testing.T) {
+	global := &http.Client{}
+	driver := NewDriver(DriverConfig{SiteURL: mustSiteURL(t), HTTPClient: global, IPFamily: "4"}, &stubStore{accounts: map[string]model.Account{}})
+	direct := driver.clientFor(protocol.AccountCredentials{ID: "a"})
+	if direct.httpClient != global {
+		t.Fatal("account without proxy must use the global transport")
+	}
+	proxied := driver.clientFor(protocol.AccountCredentials{ID: "a", Proxy: "http://user:pass@10.0.0.2:8080"})
+	if proxied == direct {
+		t.Fatal("changing the account proxy must rebuild the client")
+	}
+	transport, ok := proxied.httpClient.Transport.(*http.Transport)
+	if !ok || transport.Proxy == nil {
+		t.Fatal("proxied client has no proxy transport")
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://muse.ai/", nil)
+	proxyURL, err := transport.Proxy(req)
+	if err != nil || proxyURL == nil || proxyURL.Host != "10.0.0.2:8080" {
+		t.Fatalf("proxy = %v, %v", proxyURL, err)
+	}
+	if proxied.dialer == nil || proxied.dialer.NetDialTLSContext == nil {
+		t.Fatal("proxied client has no gateway dialer")
+	}
+	if driver.clientFor(protocol.AccountCredentials{ID: "a", Proxy: "http://user:pass@10.0.0.2:8080"}) != proxied {
+		t.Fatal("same proxy must reuse the client")
+	}
+	driver.Close()
 }

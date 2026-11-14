@@ -115,6 +115,9 @@ func TestDialWithHeaderReportsRejectedUpgrade(t *testing.T) {
 	var origin, agent string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin, agent = r.Header.Get("Origin"), r.Header.Get("User-Agent")
+		w.Header().Set("Proxy-Status", `http_request_error; e_proxy="opaque"`)
+		w.Header().Set("X-Hatch-Error", "vm_not_owned")
+		w.Header().Set("X-Hatch-Region-Hint", "MAZ")
 		http.Error(w, "forbidden", http.StatusForbidden)
 	}))
 	defer server.Close()
@@ -129,6 +132,9 @@ func TestDialWithHeaderReportsRejectedUpgrade(t *testing.T) {
 	}
 	if origin != "https://muse.ai" || agent != chromeUserAgent {
 		t.Fatalf("handshake Origin=%q User-Agent=%q", origin, agent)
+	}
+	if want := "body=forbidden; proxy-status=http_request_error; x-hatch-error=vm_not_owned"; dialErr.Detail != want {
+		t.Fatalf("detail = %q, want %q", dialErr.Detail, want)
 	}
 }
 

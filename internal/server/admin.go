@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -63,6 +64,48 @@ type accountInput struct {
 	CookieHeader string            `json:"cookie_header"`
 	Batch        string            `json:"batch"`
 	Expires      map[string]int64  `json:"expires"`
+	// Proxy binds the imported account(s) to one egress proxy. Batch lines
+	// may override it with a trailing "|proxy-url" column.
+	Proxy string `json:"proxy"`
+}
+
+// normalizeAccountProxy validates an account proxy URL. The gateway token is
+// issued to the address that fetched the homepage, so a proxy must be a
+// single fixed egress reachable with the schemes both transports support.
+func normalizeAccountProxy(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.Hostname() == "" {
+		return "", apierr.BadRequest("代理地址无效，格式如 http://user:pass@1.2.3.4:8080 或 socks5://1.2.3.4:1080")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return "", apierr.BadRequest("代理只支持 http、https、socks5、socks5h")
+	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return "", apierr.BadRequest("代理地址不能带路径或参数")
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Path = ""
+	return u.String(), nil
+}
+
+// splitBatchProxy peels an optional trailing "|scheme://host:port" proxy
+// column off a batch line body.
+func splitBatchProxy(body string) (string, string) {
+	idx := strings.LastIndex(body, "|")
+	if idx < 0 {
+		return body, ""
+	}
+	tail := strings.TrimSpace(body[idx+1:])
+	if !strings.Contains(tail, "://") {
+		return body, ""
+	}
+	return body[:idx], tail
 }
 
 func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
@@ -71,24 +114,38 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
+	defaultProxy, err := normalizeAccountProxy(in.Proxy)
+	if err != nil {
+		apierr.Write(w, r, err)
+		return
+	}
 	type entry struct {
 		label   string
 		cookies map[string]string
 		expires map[string]int64
+		proxy   string
 	}
 	entries := []entry{}
 	if in.Batch != "" {
-		for _, line := range strings.Split(in.Batch, "\n") {
+		for number, line := range strings.Split(in.Batch, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
 			label, body := "", line
-			if head, tail, ok := strings.Cut(line, "|"); ok && !strings.Contains(head, "=") {
+			if head, tail, ok := strings.Cut(line, "|"); ok && !strings.Contains(head, "=") && !strings.Contains(head, "://") {
 				label, body = strings.TrimSpace(head), tail
 			}
+			body, lineProxy := splitBatchProxy(body)
+			proxy := defaultProxy
+			if lineProxy != "" {
+				if proxy, err = normalizeAccountProxy(lineProxy); err != nil {
+					apierr.Write(w, r, apierr.BadRequest(fmt.Sprintf("第 %d 行：%v", number+1, err)))
+					return
+				}
+			}
 			if cookies := parseCookies(body); len(cookies) > 0 {
-				entries = append(entries, entry{label: label, cookies: cookies})
+				entries = append(entries, entry{label: label, cookies: cookies, proxy: proxy})
 			}
 		}
 	}
@@ -97,7 +154,7 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 		cookies[k] = v
 	}
 	if len(cookies) > 0 {
-		entries = append(entries, entry{in.Label, cookies, in.Expires})
+		entries = append(entries, entry{in.Label, cookies, in.Expires, defaultProxy})
 	}
 	if len(entries) == 0 {
 		apierr.Write(w, r, apierr.BadRequest("未解析到任何 Cookie"))
@@ -106,7 +163,7 @@ func (s *Server) addAccounts(w http.ResponseWriter, r *http.Request) {
 	added := []model.Account{}
 	missing := map[string]bool{}
 	for _, e := range entries {
-		a, err := s.store.AddAccount(e.label, e.cookies, e.expires)
+		a, err := s.store.AddAccountWithProxy(e.label, e.cookies, e.expires, e.proxy)
 		if err != nil {
 			apierr.Write(w, r, err)
 			return
@@ -149,12 +206,27 @@ func (s *Server) patchAccount(w http.ResponseWriter, r *http.Request) {
 		Label          *string `json:"label"`
 		Enabled        *bool   `json:"enabled"`
 		MaxConcurrency *int    `json:"max_concurrency"`
+		// Proxy replaces the account proxy; an empty string removes it.
+		Proxy *string `json:"proxy"`
 	}
 	if err := decodeJSON(w, r, &in); err != nil {
 		apierr.Write(w, r, err)
 		return
 	}
+	proxy := ""
+	if in.Proxy != nil {
+		var err error
+		if proxy, err = normalizeAccountProxy(*in.Proxy); err != nil {
+			apierr.Write(w, r, err)
+			return
+		}
+	}
+	proxyChanged := false
 	a, err := s.store.UpdateAccount(id, func(a *model.Account) error {
+		if in.Proxy != nil && a.Proxy != proxy {
+			a.Proxy = proxy
+			proxyChanged = true
+		}
 		if in.Label != nil {
 			if strings.TrimSpace(*in.Label) == "" {
 				return errors.New("标签不能为空")
@@ -185,11 +257,19 @@ func (s *Server) patchAccount(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, err)
 		return
 	}
-	if in.Enabled != nil && !*in.Enabled {
+	if in.Enabled != nil && !*in.Enabled || proxyChanged {
 		// A disabled account must not keep a live gateway connection (and its
 		// VM) around. The bulk path already did this; the single PATCH path
-		// previously leaked it.
+		// previously leaked it. A new proxy needs a fresh bootstrap too: the
+		// gateway token belongs to the old egress address.
 		s.invalidateAccount(id)
+	}
+	if proxyChanged {
+		label := a.ProxyLabel
+		if label == "" {
+			label = "已移除"
+		}
+		s.store.AddEvent(model.Event{Level: "info", Type: "account.proxy.update", Message: "账号代理已更新：" + label, RequestID: requestIDFrom(r.Context()), AccountID: a.ID})
 	}
 	s.pool.Wake()
 	writeJSON(w, 200, a)
@@ -321,7 +401,7 @@ func (s *Server) checkAndStoreSession(ctx context.Context, account model.Account
 		return sessionCheckResult{Message: "检测等待超时，请稍后重试"}
 	}
 	defer release()
-	session, checkErr := s.driver.CheckSession(ctx, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
+	session, checkErr := s.driver.CheckSession(ctx, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry, Proxy: account.Proxy})
 	ok := checkErr == nil && session != nil && session.Valid
 	if _, err := s.store.UpdateAccount(account.ID, func(a *model.Account) error {
 		a.LastChecked = time.Now().Unix()
@@ -416,7 +496,7 @@ func (s *Server) quota(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, r, apierr.NotFound("账号不存在"))
 		return
 	}
-	quota, err := s.queryQuota(r.Context(), driver, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry})
+	quota, err := s.queryQuota(r.Context(), driver, protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry, Proxy: account.Proxy})
 	if err != nil {
 		s.log.Warn("quota query failed", "account", account.ID, "error", err)
 		apierr.Write(w, r, mapQuotaError(err))

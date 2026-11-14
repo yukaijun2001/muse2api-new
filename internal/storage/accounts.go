@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"muse2api/internal/model"
@@ -13,7 +15,7 @@ import (
 func (s *Store) ListAccounts() []model.Account {
 	rows, err := s.db.Query(`SELECT id, label, status, enabled, essential_ok, cookie_count, created_at,
 last_used, last_checked, last_keepalive, use_count, expires_at, expiry_estimated,
-last_error, note, max_concurrency, failure_count, cooldown_until, credentials_version, quota_json, ok, synced_at FROM accounts`)
+last_error, note, max_concurrency, failure_count, cooldown_until, credentials_version, quota_json, ok, synced_at, proxy_label FROM accounts`)
 	if err != nil {
 		return nil
 	}
@@ -40,7 +42,7 @@ last_error, note, max_concurrency, failure_count, cooldown_until, credentials_ve
 func (s *Store) GetAccount(id string) (model.Account, error) {
 	row := s.db.QueryRow(`SELECT id, label, status, enabled, essential_ok, cookie_count, created_at,
 last_used, last_checked, last_keepalive, use_count, expires_at, expiry_estimated,
-last_error, note, max_concurrency, failure_count, cooldown_until, credentials_version, quota_json, ok, synced_at FROM accounts WHERE id = ?`, id)
+last_error, note, max_concurrency, failure_count, cooldown_until, credentials_version, quota_json, ok, synced_at, proxy_label FROM accounts WHERE id = ?`, id)
 	a, err := scanAccount(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -56,11 +58,17 @@ last_error, note, max_concurrency, failure_count, cooldown_until, credentials_ve
 }
 
 func (s *Store) AddAccount(label string, cookies map[string]string, expires map[string]int64) (model.Account, error) {
+	return s.AddAccountWithProxy(label, cookies, expires, "")
+}
+
+// AddAccountWithProxy imports an account bound to its own egress proxy. The
+// proxy URL is stored with the encrypted credentials.
+func (s *Store) AddAccountWithProxy(label string, cookies map[string]string, expires map[string]int64, proxy string) (model.Account, error) {
 	if len(cookies) == 0 {
 		return model.Account{}, errors.New("cookies required")
 	}
 	now := time.Now().Unix()
-	a := model.Account{ID: randomID(6), Label: label, Cookies: cloneStrings(cookies), CookieExpiry: cloneInt64s(expires), Enabled: true, CreatedAt: now, MaxConcurrency: 1, Status: model.AccountUnknown}
+	a := model.Account{ID: randomID(6), Label: label, Cookies: cloneStrings(cookies), CookieExpiry: cloneInt64s(expires), Proxy: proxy, Enabled: true, CreatedAt: now, MaxConcurrency: 1, Status: model.AccountUnknown}
 	if a.Label == "" {
 		a.Label = a.ID
 	}
@@ -151,11 +159,11 @@ func (s *Store) insertAccountTx(tx *sql.Tx, a model.Account) error {
 	ok := nullableBool(a.OK)
 	if _, err := tx.Exec(`INSERT INTO accounts(id, label, status, enabled, essential_ok, cookie_count,
 created_at, last_used, last_checked, last_keepalive, use_count, expires_at, expiry_estimated,
-last_error, note, max_concurrency, failure_count, cooldown_until, credentials_version, quota_json, ok, synced_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+last_error, note, max_concurrency, failure_count, cooldown_until, credentials_version, quota_json, ok, synced_at, proxy_label)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Label, string(a.Status), boolInt(a.Enabled), boolInt(a.EssentialOK), a.CookieCount,
 		a.CreatedAt, a.LastUsed, a.LastChecked, a.LastKeepalive, a.UseCount, a.ExpiresAt, boolInt(a.ExpiryEstimated),
-		a.LastError, a.Note, a.MaxConcurrency, a.FailureCount, a.CooldownUntil, a.CredentialsVersion, quota, ok, a.SyncedAt); err != nil {
+		a.LastError, a.Note, a.MaxConcurrency, a.FailureCount, a.CooldownUntil, a.CredentialsVersion, quota, ok, a.SyncedAt, a.ProxyLabel); err != nil {
 		return err
 	}
 	return s.saveCredentialsTx(tx, a)
@@ -168,10 +176,10 @@ func (s *Store) updateAccountTx(tx *sql.Tx, a model.Account) error {
 	}
 	res, err := tx.Exec(`UPDATE accounts SET label = ?, status = ?, enabled = ?, essential_ok = ?, cookie_count = ?,
 last_used = ?, last_checked = ?, last_keepalive = ?, use_count = ?, expires_at = ?, expiry_estimated = ?,
-last_error = ?, note = ?, max_concurrency = ?, failure_count = ?, cooldown_until = ?, credentials_version = ?, quota_json = ?, ok = ?, synced_at = ? WHERE id = ?`,
+last_error = ?, note = ?, max_concurrency = ?, failure_count = ?, cooldown_until = ?, credentials_version = ?, quota_json = ?, ok = ?, synced_at = ?, proxy_label = ? WHERE id = ?`,
 		a.Label, string(a.Status), boolInt(a.Enabled), boolInt(a.EssentialOK), a.CookieCount,
 		a.LastUsed, a.LastChecked, a.LastKeepalive, a.UseCount, a.ExpiresAt, boolInt(a.ExpiryEstimated),
-		a.LastError, a.Note, a.MaxConcurrency, a.FailureCount, a.CooldownUntil, a.CredentialsVersion, quota, nullableBool(a.OK), a.SyncedAt, a.ID)
+		a.LastError, a.Note, a.MaxConcurrency, a.FailureCount, a.CooldownUntil, a.CredentialsVersion, quota, nullableBool(a.OK), a.SyncedAt, a.ProxyLabel, a.ID)
 	if err != nil {
 		return err
 	}
@@ -183,7 +191,7 @@ last_error = ?, note = ?, max_concurrency = ?, failure_count = ?, cooldown_until
 }
 
 func (s *Store) saveCredentialsTx(tx *sql.Tx, a model.Account) error {
-	plain, err := json.Marshal(diskCredentials{Cookies: a.Cookies, CookieExpiry: a.CookieExpiry})
+	plain, err := json.Marshal(diskCredentials{Cookies: a.Cookies, CookieExpiry: a.CookieExpiry, Proxy: a.Proxy})
 	if err != nil {
 		return err
 	}
@@ -227,7 +235,7 @@ func (s *Store) loadCredentials(a *model.Account) error {
 			return err
 		}
 	}
-	a.Cookies, a.CookieExpiry = creds.Cookies, creds.CookieExpiry
+	a.Cookies, a.CookieExpiry, a.Proxy = creds.Cookies, creds.CookieExpiry, creds.Proxy
 	return nil
 }
 
@@ -242,7 +250,7 @@ func scanAccount(row rowScanner) (model.Account, error) {
 	var ok sql.NullInt64
 	if err := row.Scan(&a.ID, &a.Label, &status, &enabled, &essential, &a.CookieCount,
 		&a.CreatedAt, &a.LastUsed, &a.LastChecked, &a.LastKeepalive, &a.UseCount,
-		&a.ExpiresAt, &estimated, &a.LastError, &a.Note, &a.MaxConcurrency, &a.FailureCount, &a.CooldownUntil, &a.CredentialsVersion, &quota, &ok, &a.SyncedAt); err != nil {
+		&a.ExpiresAt, &estimated, &a.LastError, &a.Note, &a.MaxConcurrency, &a.FailureCount, &a.CooldownUntil, &a.CredentialsVersion, &quota, &ok, &a.SyncedAt, &a.ProxyLabel); err != nil {
 		return model.Account{}, err
 	}
 	a.Status = model.AccountStatus(status)
@@ -288,7 +296,23 @@ func boolInt(v bool) int {
 // tasks
 // ---------------------------------------------------------------------------
 
+// MaskProxyURL reduces a proxy URL to scheme://host:port so the admin UI can
+// show which egress an account uses without exposing proxy credentials.
+func MaskProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "invalid"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 func normalizeAccount(a *model.Account) {
+	a.Proxy = strings.TrimSpace(a.Proxy)
+	a.ProxyLabel = MaskProxyURL(a.Proxy)
 	a.CookieCount = len(a.Cookies)
 	a.EssentialOK = a.Cookies["hatch_sess"] != "" && a.Cookies["hatch_vml"] != ""
 	if a.MaxConcurrency <= 0 {
@@ -323,6 +347,7 @@ func normalizeAccount(a *model.Account) {
 func sanitizeAccount(a model.Account) model.Account {
 	a.Cookies = nil
 	a.CookieExpiry = nil
+	a.Proxy = ""
 	return a
 }
 

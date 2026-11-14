@@ -11,7 +11,13 @@ import { listKeyDown, useMediaQuery } from '../lib/hooks'
 import { Badge, Button, CopyButton, Empty, ErrorState, Field, InlineError, Input, Loading, PageHeader, RefreshError, SearchField, Select, SuccessMessage } from '../components/UI'
 import { Confirm, Modal } from '../components/Dialog'
 
-const accountSchema = z.object({ label: z.string().trim().max(80, '标签最多 80 个字符'), cookie_header: z.string().trim().min(1, '请粘贴 Cookie Header 或 JSON') })
+const proxyPattern = /^(https?|socks5h?):\/\/[^\s/]+\/?$/i
+const proxyHint = '格式如 http://user:pass@1.2.3.4:8080 或 socks5://1.2.3.4:1080'
+const accountSchema = z.object({
+  label: z.string().trim().max(80, '标签最多 80 个字符'),
+  cookie_header: z.string().trim().min(1, '请粘贴 Cookie Header 或 JSON'),
+  proxy: z.string().trim().refine(value => value === '' || proxyPattern.test(value), proxyHint),
+})
 type AccountForm = z.infer<typeof accountSchema>
 const statusTone = (status: AccountStatus) => status === 'active' ? 'success' : ['expired', 'error'].includes(status) ? 'danger' : status === 'unknown' ? 'neutral' : 'warning'
 
@@ -193,7 +199,18 @@ export default function Accounts({ initialSearch = '', initialStatus = '', initi
       setMessage('凭据已更新，后台正在检测并刷新额度')
       setAutoCheckIds(new Set([reauth.id]))
     }} />
-    <Modal open={Boolean(edit)} onOpenChange={() => setEdit(undefined)} title="编辑账号" description={edit?.id}>{edit && <form className="form-stack" onSubmit={event => { event.preventDefault(); const form = new FormData(event.currentTarget); action.mutate({ path: `/admin/accounts/${edit.id}`, method: 'PATCH', body: { label: form.get('label'), max_concurrency: Number(form.get('max_concurrency')) } }, { onSuccess: () => setEdit(undefined) }) }}><Field label="账号标签"><Input name="label" required maxLength={80} defaultValue={edit.label} /></Field><Field label="并发上限"><Input name="max_concurrency" type="number" min={1} max={32} defaultValue={edit.max_concurrency} /></Field><div className="dialog-actions"><Button type="button" variant="secondary" onClick={() => setEdit(undefined)}>取消</Button><Button disabled={action.isPending}>保存</Button></div></form>}</Modal>
+    <Modal open={Boolean(edit)} onOpenChange={() => setEdit(undefined)} title="编辑账号" description={edit?.id}>{edit && <form className="form-stack" onSubmit={event => {
+      event.preventDefault()
+      const form = new FormData(event.currentTarget)
+      const body: Record<string, unknown> = { label: form.get('label'), max_concurrency: Number(form.get('max_concurrency')) }
+      // The stored proxy is never sent back to the browser, so an empty field
+      // keeps it; only an explicit value or the remove box changes it.
+      const proxy = String(form.get('proxy') ?? '').trim()
+      if (proxy && !proxyPattern.test(proxy)) { setErrorMessage(`出口代理无效：${proxyHint}`); return }
+      if (proxy) body.proxy = proxy
+      else if (form.get('remove_proxy')) body.proxy = ''
+      action.mutate({ path: `/admin/accounts/${edit.id}`, method: 'PATCH', body }, { onSuccess: () => { setEdit(undefined); setErrorMessage('') } })
+    }}><Field label="账号标签"><Input name="label" required maxLength={80} defaultValue={edit.label} /></Field><Field label="并发上限"><Input name="max_concurrency" type="number" min={1} max={32} defaultValue={edit.max_concurrency} /></Field><Field label="出口代理"><Input name="proxy" placeholder={edit.proxy ? `当前 ${edit.proxy}，留空不修改` : 'http://user:pass@1.2.3.4:8080，留空使用全局设置'} autoComplete="off" spellCheck={false} /></Field>{edit.proxy && <label className="select-all"><input type="checkbox" name="remove_proxy" />移除出口代理，改用全局设置</label>}<div className="dialog-actions"><Button type="button" variant="secondary" onClick={() => setEdit(undefined)}>取消</Button><Button disabled={action.isPending}>保存</Button></div></form>}</Modal>
     <Confirm open={Boolean(remove)} onOpenChange={() => setRemove(undefined)} title={`删除账号「${remove?.label}」？`} description="永久删除账号及加密凭据，任务与媒体保留。" busy={action.isPending} onConfirm={() => remove && deleteAccount(remove)} />
   </div>
 }
@@ -264,6 +281,7 @@ function AccountInspector({ account, busy, onTest, onQuota, onReauth, onEdit, on
           <Detail label="创建时间" value={fullDate(account.created_at)} />
           <Detail label="Cookie" value={`${account.cookie_count} 条 Cookie`} />
           <Detail label="必要凭据" value={account.essential_ok ? '完整' : '缺失'} />
+          <Detail label="出口代理" value={account.proxy || '全局设置'} />
         </div>
       </section>
 
@@ -298,9 +316,9 @@ function QuotaMini({ quota }: { quota?: Account['quota'] }) {
 
 function AccountDialog({ open, onOpenChange, onSubmit, account }: { open: boolean; onOpenChange: (open: boolean) => void; onSubmit: (value: AccountForm) => Promise<void>; account?: Account }) {
   const [serverError, setServerError] = useState('')
-  const { register, handleSubmit, reset, formState: { errors, isSubmitting } } = useForm<AccountForm>({ resolver: zodResolver(accountSchema), defaultValues: { label: '', cookie_header: '' } })
+  const { register, handleSubmit, reset, formState: { errors, isSubmitting } } = useForm<AccountForm>({ resolver: zodResolver(accountSchema), defaultValues: { label: '', cookie_header: '', proxy: '' } })
   const submit = handleSubmit(async value => { setServerError(''); try { await onSubmit(value); reset() } catch (err) { setServerError(err instanceof Error ? err.message : '提交失败') } })
-  return <Modal open={open} onOpenChange={onOpenChange} title={account ? '更新凭据' : '添加账号'} description={account ? '粘贴新的 Cookie Header 或 JSON，后台会自动检测。' : '从已登录的 Muse 浏览器会话导入 Cookie。'}><form className="form-stack" onSubmit={submit}><Field label="账号标签"><Input placeholder="例如：主账号" {...register('label')} /></Field><Field label="Cookie Header 或 JSON" error={errors.cookie_header?.message}><textarea className="input textarea credential-input" rows={6} placeholder="hatch_sess=…; hatch_vml=…" autoComplete="off" spellCheck={false} {...register('cookie_header')} /></Field>{serverError && <InlineError>{serverError}</InlineError>}<div className="dialog-actions"><Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>取消</Button><Button disabled={isSubmitting}>{isSubmitting ? '提交中…' : account ? '更新' : '导入'}</Button></div></form></Modal>
+  return <Modal open={open} onOpenChange={onOpenChange} title={account ? '更新凭据' : '添加账号'} description={account ? '粘贴新的 Cookie Header 或 JSON，后台会自动检测。' : '从已登录的 Muse 浏览器会话导入 Cookie。'}><form className="form-stack" onSubmit={submit}><Field label="账号标签"><Input placeholder="例如：主账号" {...register('label')} /></Field><Field label="Cookie Header 或 JSON" error={errors.cookie_header?.message}><textarea className="input textarea credential-input" rows={6} placeholder="hatch_sess=…; hatch_vml=…" autoComplete="off" spellCheck={false} {...register('cookie_header')} /></Field>{!account && <Field label="出口代理（可选）" error={errors.proxy?.message}><Input placeholder="http://user:pass@1.2.3.4:8080，留空使用全局设置" autoComplete="off" spellCheck={false} {...register('proxy')} /></Field>}{serverError && <InlineError>{serverError}</InlineError>}<div className="dialog-actions"><Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>取消</Button><Button disabled={isSubmitting}>{isSubmitting ? '提交中…' : account ? '更新' : '导入'}</Button></div></form></Modal>
 }
 
 function Detail({ label, value }: { label: string; value: string }) { return <div><span className="detail-label">{label}</span><div className="detail-value">{value}</div></div> }

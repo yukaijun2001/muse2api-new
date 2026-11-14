@@ -38,6 +38,11 @@ type Account struct {
 	Quota              *Quota            `json:"quota,omitempty"`
 	OK                 *bool             `json:"ok"`
 	SyncedAt           int64             `json:"synced_at,omitempty"`
+	// Proxy is the account's egress proxy URL. It can carry credentials, so it
+	// is stored with the encrypted cookies and never serialized; ProxyLabel is
+	// the masked scheme://host:port shown in the admin UI.
+	Proxy      string `json:"-"`
+	ProxyLabel string `json:"proxy,omitempty"`
 }
 
 type Quota struct {

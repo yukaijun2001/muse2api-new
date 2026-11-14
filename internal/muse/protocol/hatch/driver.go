@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,6 +43,9 @@ type DriverConfig struct {
 	MaxMediaBytes int64
 	HTTPClient    *http.Client
 	WSDialer      *websocket.Dialer
+	// IPFamily ("4", "6" or "auto") is applied to per-account proxy
+	// transports, matching the global HTTPClient/WSDialer.
+	IPFamily string
 }
 
 // Driver implements protocol.Driver over the Noise/protobuf gateway.
@@ -77,16 +81,59 @@ func NewDriver(cfg DriverConfig, store AccountStore) *Driver {
 }
 
 // clientFor returns the per-account protocol client, creating it on first use.
-func (d *Driver) clientFor(accountID string) *Client {
+// An account bound to its own proxy gets its own transport, so the homepage
+// fetch (which issues the gateway token) and the gateway dial share one
+// egress address.
+func (d *Driver) clientFor(creds protocol.AccountCredentials) *Client {
 	d.clientsMu.Lock()
 	defer d.clientsMu.Unlock()
-	if client := d.clients[accountID]; client != nil {
-		return client
+	if client := d.clients[creds.ID]; client != nil {
+		if client.proxy == creds.Proxy {
+			return client
+		}
+		delete(d.clients, creds.ID)
+		go client.invalidate()
 	}
-	client := NewClientWithWSURL(d.cfg.SiteURL, d.cfg.HTTPClient, d.cfg.WSURL)
-	client.SetWSDialer(d.cfg.WSDialer)
-	d.clients[accountID] = client
+	httpClient, wsDialer := d.transportFor(creds.Proxy)
+	client := NewClientWithWSURL(d.cfg.SiteURL, httpClient, d.cfg.WSURL)
+	client.SetWSDialer(wsDialer)
+	client.proxy = creds.Proxy
+	d.clients[creds.ID] = client
 	return client
+}
+
+// transportFor builds the HTTP client and WebSocket dialer for an account
+// proxy. An empty or unparsable proxy falls back to the global transport;
+// the admin API validates proxies before they are stored.
+func (d *Driver) transportFor(proxy string) (*http.Client, *websocket.Dialer) {
+	if proxy == "" {
+		return d.cfg.HTTPClient, d.cfg.WSDialer
+	}
+	proxyURL, err := url.Parse(proxy)
+	if err != nil || proxyURL.Host == "" {
+		return d.cfg.HTTPClient, d.cfg.WSDialer
+	}
+	family := d.cfg.IPFamily
+	netDialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return netDialer.DialContext(ctx, PinNetwork(network, family), address)
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          16,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	timeout := 30 * time.Second
+	if d.cfg.HTTPClient != nil && d.cfg.HTTPClient.Timeout > 0 {
+		timeout = d.cfg.HTTPClient.Timeout
+	}
+	chromeDialer := NewChromeWSDialer(proxyURL)
+	chromeDialer.SetIPFamily(family)
+	wsDialer := &websocket.Dialer{HandshakeTimeout: 20 * time.Second, NetDialTLSContext: chromeDialer.DialContext}
+	return &http.Client{Transport: transport, Timeout: timeout}, wsDialer
 }
 
 // forgetAccount drops one account's client and its live gateway connection,
@@ -116,7 +163,7 @@ func (d *Driver) credentials(accountID string) (protocol.AccountCredentials, err
 	if len(account.Cookies) == 0 {
 		return protocol.AccountCredentials{}, errors.New("账号没有 Cookie")
 	}
-	return protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry, Version: account.CredentialsVersion}, nil
+	return protocol.AccountCredentials{ID: account.ID, Cookies: account.Cookies, CookieExpiry: account.CookieExpiry, Version: account.CredentialsVersion, Proxy: account.Proxy}, nil
 }
 
 func (d *Driver) persist(creds protocol.AccountCredentials, opErr error) {
@@ -180,7 +227,7 @@ func (d *Driver) Chat(ctx context.Context, request protocol.ChatRequest) (<-chan
 	out := make(chan protocol.ChatEvent, 32)
 	go func() {
 		defer close(out)
-		stream, streamErr := d.clientFor(request.AccountID).ChatStream(ctx, creds.Cookies, request.Prompt, d.cfg.ChatTimeout)
+		stream, streamErr := d.clientFor(creds).ChatStream(ctx, creds.Cookies, request.Prompt, d.cfg.ChatTimeout)
 		if streamErr != nil {
 			d.persist(creds, streamErr)
 			select {
@@ -241,7 +288,7 @@ func (d *Driver) GenerateImage(ctx context.Context, request protocol.ImageReques
 		return nil, err
 	}
 	prompt := protocol.BuildImagePrompt(request)
-	text, media, err := d.clientFor(creds.ID).ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.ImageTimeout)
+	text, media, err := d.clientFor(creds).ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.ImageTimeout)
 	d.persist(creds, err)
 	if err != nil {
 		return nil, err
@@ -273,7 +320,7 @@ func (d *Driver) CreateVideo(ctx context.Context, request protocol.VideoRequest)
 		return nil, err
 	}
 	prompt := protocol.BuildVideoPrompt(request)
-	text, media, err := d.clientFor(creds.ID).ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.VideoTimeout)
+	text, media, err := d.clientFor(creds).ChatWithItems(ctx, creds.Cookies, prompt, items, true, d.cfg.VideoTimeout)
 	d.persist(creds, err)
 	if err != nil {
 		return nil, err
@@ -294,7 +341,7 @@ func (d *Driver) pickMedia(ctx context.Context, creds protocol.AccountCredential
 		if ref.Kind != expect {
 			continue
 		}
-		path, mimeType, err := d.clientFor(creds.ID).DownloadToFile(ctx, creds.Cookies, ref, d.cfg.MediaDir, d.cfg.MaxMediaBytes)
+		path, mimeType, err := d.clientFor(creds).DownloadToFile(ctx, creds.Cookies, ref, d.cfg.MediaDir, d.cfg.MaxMediaBytes)
 		if err != nil {
 			lastErr = err
 			continue
@@ -322,11 +369,12 @@ func (d *Driver) GetVideoTask(context.Context, string) (*protocol.VideoTask, err
 }
 
 func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountCredentials) (*protocol.Session, error) {
+	httpClient, _ := d.transportFor(credentials.Proxy)
 	opts := SessionOptions{
 		BaseURL:      d.cfg.SiteURL,
 		Cookies:      credentials.Cookies,
 		CookieExpiry: credentials.CookieExpiry,
-		Client:       d.cfg.HTTPClient,
+		Client:       httpClient,
 	}
 	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session", nil, "")
 	if err != nil {
@@ -346,7 +394,7 @@ func (d *Driver) CheckSession(ctx context.Context, credentials protocol.AccountC
 // QueryQuota reads the subscription/usage snapshot through the settings server
 // action; no VM wake and no browser are involved.
 func (d *Driver) QueryQuota(ctx context.Context, credentials protocol.AccountCredentials) (*model.Quota, error) {
-	return d.clientFor(credentials.ID).QueryQuota(ctx, credentials)
+	return d.clientFor(credentials).QueryQuota(ctx, credentials)
 }
 
 func (d *Driver) Close() error {

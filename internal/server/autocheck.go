@@ -106,7 +106,7 @@ func (s *Server) runAutoCheck(id string) {
 		return
 	}
 	quotaCtx, quotaCancel := context.WithTimeout(s.autoCheck.ctx, 90*time.Second)
-	quota, err := s.queryQuota(quotaCtx, driver, protocol.AccountCredentials{ID: fresh.ID, Cookies: fresh.Cookies, CookieExpiry: fresh.CookieExpiry})
+	quota, err := s.queryQuota(quotaCtx, driver, protocol.AccountCredentials{ID: fresh.ID, Cookies: fresh.Cookies, CookieExpiry: fresh.CookieExpiry, Proxy: fresh.Proxy})
 	quotaCancel()
 	if err != nil {
 		message := mapQuotaError(err).Error()

@@ -75,6 +75,8 @@ type AccountCredentials struct {
 	Cookies      map[string]string
 	CookieExpiry map[string]int64
 	Version      int64
+	// Proxy is the account's own egress proxy URL; empty uses the global one.
+	Proxy string
 }
 
 type Driver interface {

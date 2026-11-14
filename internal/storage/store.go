@@ -33,6 +33,7 @@ type diskAccounts struct {
 type diskCredentials struct {
 	Cookies      map[string]string `json:"cookies"`
 	CookieExpiry map[string]int64  `json:"cookies_exp"`
+	Proxy        string            `json:"proxy,omitempty"`
 }
 
 type diskAPIKey struct {
@@ -161,7 +162,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   credentials_version INTEGER NOT NULL DEFAULT 0,
   quota_json TEXT NOT NULL DEFAULT '',
   ok INTEGER,
-  synced_at INTEGER NOT NULL DEFAULT 0
+  synced_at INTEGER NOT NULL DEFAULT 0,
+  proxy_label TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS account_credentials (
   account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -238,6 +240,7 @@ CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at DESC);
 		{"failure_count", `ALTER TABLE accounts ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0`},
 		{"cooldown_until", `ALTER TABLE accounts ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0`},
 		{"credentials_version", `ALTER TABLE accounts ADD COLUMN credentials_version INTEGER NOT NULL DEFAULT 0`},
+		{"proxy_label", `ALTER TABLE accounts ADD COLUMN proxy_label TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, column := range accountColumns {
 		var count int

@@ -47,6 +47,11 @@ type Config struct {
 	PublicMedia              bool
 	LogLevel                 string
 	ProxyURL                 string
+	// IPFamily pins upstream connections to one address family ("4", "6" or
+	// "auto"). The gateway token is bound to the egress address that fetched
+	// it, so a dual-stack host must not reach muse.ai over IPv6 and the
+	// gateway over IPv4 (or the reverse).
+	IPFamily string
 }
 
 func Load(homeOverride string) (Config, error) {
@@ -107,6 +112,7 @@ func Load(homeOverride string) (Config, error) {
 		PublicMedia:              boolEnv("MUSE2API_PUBLIC_MEDIA"),
 		LogLevel:                 env("MUSE2API_LOG_LEVEL", "info"),
 		ProxyURL:                 proxyURL,
+		IPFamily:                 strings.ToLower(strings.TrimSpace(env("MUSE2API_IP_FAMILY", "4"))),
 	}
 	if c.AdminUsername == "" {
 		c.AdminUsername = "admin"
@@ -188,6 +194,11 @@ func Load(homeOverride string) (Config, error) {
 		if _, err = url.ParseRequestURI(c.ProxyURL); err != nil {
 			return Config{}, fmt.Errorf("MUSE2API_PROXY 无效")
 		}
+	}
+	switch c.IPFamily {
+	case "4", "6", "auto":
+	default:
+		return Config{}, fmt.Errorf("MUSE2API_IP_FAMILY 只能是 4、6 或 auto")
 	}
 	return c, nil
 }
