@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -20,9 +20,14 @@ import (
 
 // Gateway constants come from the web bundle (protocol.json).
 const (
-	DefaultLBHost = "hatch.metaaivm.com"
-	DefaultWSPath = "/v1/noise"
-	DefaultAppID  = "hatch-web"
+	DefaultLBHost     = "hatch.metaaivm.com"
+	DefaultWSPath     = "/v1/noise"
+	DefaultAppID      = "hatch-web"
+	DefaultAppVersion = "1"
+
+	gatewayPagePath    = "/"
+	gatewayPageMaxSize = 8 << 20
+	gatewayScanWindow  = 8 << 10
 )
 
 // Session is a bootstrapped gateway admission (VM + auth token).
@@ -30,7 +35,6 @@ type Session struct {
 	VMID         string
 	Endpoint     string
 	AuthToken    string
-	AccessToken  string
 	Notary       string
 	WSURL        string
 	Cookies      map[string]string
@@ -51,8 +55,13 @@ type SessionOptions struct {
 	WSURL string
 }
 
-// Bootstrap resolves the account VM, wakes it when needed, obtains the hatch
-// auth token (and optional noise notary token) and builds the wss URL.
+// Bootstrap resolves the account VM and its gateway admission tokens, wakes
+// the VM when needed and builds the wss URL.
+//
+// muse.ai no longer hands out VM admission through /api/session and
+// /api/hatch/token (the former now answers status=unavailable). The signed-in
+// homepage embeds the gateway bootstrap (vm, auth token, noise notary token)
+// in its server-rendered HTML, and the web client connects with exactly that.
 func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	if opts.BaseURL == nil {
 		return nil, errors.New("missing base url")
@@ -79,55 +88,30 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 		appID = DefaultAppID
 	}
 
-	accessResp, err := opts.requestJSON(ctx, http.MethodPost, "/api/auth/check", nil, "")
-	if err != nil {
-		return nil, fmt.Errorf("muse.ai auth check: %w", err)
-	}
-	accessToken := strings.TrimSpace(asString(accessResp["access_token"]))
-	if accessToken == "" {
-		return nil, errors.New("auth/check response is missing access_token")
-	}
-
-	info, err := opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil, "")
+	init, err := opts.loadGatewayInit(ctx)
 	if err != nil {
 		return nil, err
 	}
-	vmID := asString(info["vm_id"])
-	endpoint := asString(info["endpoint_url"])
-	state := asString(info["vm_state"])
-	if vmID == "" || endpoint == "" {
-		// Keep the whole reply: newer deployments explain unassigned VMs
-		// (capacity, CVM migration, claim state) in fields beyond status.
-		raw, _ := json.Marshal(info)
-		return nil, fmt.Errorf("muse.ai did not assign a VM (status=%v): %s", info["status"], truncate(raw, 400))
-	}
 
-	if !strings.EqualFold(state, "RUNNING") {
-		if err := opts.wakeVM(ctx, vmID, accessToken); err != nil {
+	if !strings.EqualFold(init.VMState, "RUNNING") {
+		// The web client requests a wake on mount whenever the VM is not
+		// known to be running. An unknown state is not fatal: try the gateway.
+		if err := opts.wakeVM(ctx, init.VMID); err != nil && init.VMState != "" {
 			return nil, err
 		}
 		deadline := time.Now().Add(45 * time.Second)
-		for {
-			info, err = opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil, "")
-			if err == nil {
-				if id := asString(info["vm_id"]); id != "" {
-					vmID = id
-				}
-				if ep := asString(info["endpoint_url"]); ep != "" {
-					endpoint = ep
-				}
-				state = asString(info["vm_state"])
-				if strings.EqualFold(state, "RUNNING") {
-					break
-				}
-			}
+		for init.VMState != "" && !strings.EqualFold(init.VMState, "RUNNING") {
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("VM %s did not become RUNNING (state=%s)", vmID, state)
+				return nil, fmt.Errorf("VM %s did not become RUNNING (state=%s)", init.VMID, init.VMState)
 			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(1500 * time.Millisecond):
+			}
+			// Re-read the page: it carries the live state and fresh tokens.
+			if next, err := opts.loadGatewayInit(ctx); err == nil {
+				init = next
 			}
 		}
 		// Let the VM's noise listener bind after a wake.
@@ -138,50 +122,224 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 		}
 	}
 
-	vmAddress := "wss://" + vmID + ".metaaivm.com/"
-	tokenResp, err := opts.requestJSON(ctx, http.MethodPost, "/api/hatch/token", map[string]any{
-		"vmAddress": vmAddress,
-		"vmName":    vmID,
-	}, accessToken)
-	if err != nil {
-		var authErr *AuthError
-		if errors.As(err, &authErr) {
-			// A stale hatch_vml cookie is the usual cause of 401/403 here;
-			// refresh /api/session once and retry the token request.
-			if _, refreshErr := opts.requestJSON(ctx, http.MethodGet, "/api/session?vm_state=live", nil, ""); refreshErr == nil {
-				tokenResp, err = opts.requestJSON(ctx, http.MethodPost, "/api/hatch/token", map[string]any{
-					"vmAddress": vmAddress,
-					"vmName":    vmID,
-				}, accessToken)
-			}
+	wsURL := opts.WSURL
+	if wsURL == "" {
+		// Same parameter order as the web client.
+		params := []string{
+			"vm_id=" + url.QueryEscape(init.VMID),
+			"auth_token=" + url.QueryEscape(init.AuthToken),
 		}
+		if init.NotaryToken != "" {
+			params = append(params, "notary_token="+url.QueryEscape(init.NotaryToken))
+		}
+		params = append(params,
+			"app_id="+url.QueryEscape(appID),
+			"app_version="+DefaultAppVersion,
+			"request_id="+randomUUID(),
+		)
+		wsURL = "wss://" + lbHost + wsPath + "?" + strings.Join(params, "&")
 	}
+	return &Session{VMID: init.VMID, Endpoint: init.GatewayURL, AuthToken: init.AuthToken, Notary: init.NotaryToken, WSURL: wsURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
+}
+
+// gatewayInit is the gateway bootstrap the signed-in homepage renders.
+type gatewayInit struct {
+	VMID        string
+	GatewayURL  string
+	AuthToken   string
+	NotaryToken string
+	VMState     string
+	Assignment  string
+	Issue       any
+}
+
+func (o *SessionOptions) loadGatewayInit(ctx context.Context) (*gatewayInit, error) {
+	page, matchedPath, err := o.fetchPage(ctx, gatewayPagePath)
 	if err != nil {
 		return nil, err
 	}
-	authToken := strings.TrimSpace(asString(tokenResp["token"]))
-	if authToken == "" {
-		return nil, errors.New("hatch/token response is missing token")
+	init := parseGatewayInit(page)
+	if init == nil {
+		if strings.Contains(matchedPath, "logged-out") || looksLikeLoginPage([]byte(page)) {
+			return nil, fmt.Errorf("muse.ai served the signed-out page: %w", protocol.ErrSessionExpired)
+		}
+		return nil, errors.New("muse.ai homepage has no gateway bootstrap (__HATCH_GATEWAY_INIT__)")
+	}
+	if init.Assignment != "" && !strings.EqualFold(init.Assignment, "assigned") {
+		return nil, fmt.Errorf("muse.ai did not assign a VM (assignment=%s issue=%v)", init.Assignment, init.Issue)
+	}
+	if init.VMID == "" || init.AuthToken == "" {
+		return nil, fmt.Errorf("muse.ai gateway bootstrap is missing vm or auth token (assignment=%s issue=%v)", init.Assignment, init.Issue)
+	}
+	return init, nil
+}
+
+var flightChunkRe = regexp.MustCompile(`self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)`)
+
+// parseGatewayInit collects every gateway bootstrap object on the page. The
+// HTML carries an early window.__HATCH_GATEWAY_INIT__ script (the tokens the
+// web client actually connects with) plus React Flight copies of the server
+// data, the authoritative one of which holds the live VM state.
+func parseGatewayInit(page string) *gatewayInit {
+	texts := []string{page}
+	for _, match := range flightChunkRe.FindAllStringSubmatch(page, -1) {
+		var chunk string
+		if json.Unmarshal([]byte(match[1]), &chunk) == nil {
+			texts = append(texts, chunk)
+		}
+	}
+	var objects []map[string]any
+	for _, text := range texts {
+		objects = append(objects, gatewayObjects(text)...)
+	}
+	if len(objects) == 0 {
+		return nil
 	}
 
-	notary := ""
-	if nr, err := opts.requestJSON(ctx, http.MethodPost, "/api/hatch/noise-notary-token", map[string]any{"vmName": vmID}, accessToken); err == nil {
-		notary = strings.TrimSpace(asString(nr["notaryToken"]))
+	rank := func(obj map[string]any) int {
+		switch {
+		case obj["version"] != nil:
+			return 0
+		case asString(obj["gatewayBootstrapSource"]) == "authoritative":
+			return 1
+		default:
+			return 2
+		}
 	}
+	best := objects[0]
+	for _, obj := range objects[1:] {
+		if rank(obj) < rank(best) {
+			best = obj
+		}
+	}
+	init := &gatewayInit{
+		VMID:        firstNonEmpty(asString(best["vmId"]), asString(best["vmName"])),
+		GatewayURL:  asString(best["gatewayUrl"]),
+		AuthToken:   strings.TrimSpace(asString(best["authToken"])),
+		NotaryToken: strings.TrimSpace(asString(best["noiseNotaryToken"])),
+	}
+	stateRank := 3
+	for _, obj := range objects {
+		if init.VMID == "" {
+			init.VMID = firstNonEmpty(asString(obj["vmId"]), asString(obj["vmName"]))
+		}
+		if assignment := asString(obj["vmAssignment"]); assignment != "" && (init.Assignment == "" || rank(obj) == 1) {
+			init.Assignment = assignment
+			init.Issue = obj["vmResolutionIssue"]
+		}
+		if state := asString(obj["vmState"]); state != "" && rank(obj) < stateRank {
+			init.VMState = state
+			stateRank = rank(obj)
+		}
+	}
+	return init
+}
 
-	params := url.Values{}
-	params.Set("vm_id", vmID)
-	params.Set("auth_token", authToken)
-	params.Set("app_id", appID)
-	params.Set("request_id", randomRequestID())
-	if notary != "" {
-		params.Set("notary_token", notary)
+// gatewayObjects decodes the JSON objects that directly own an authToken.
+// Starting from each key it walks back to the nearest brace whose object
+// decodes and contains the key at its top level.
+func gatewayObjects(text string) []map[string]any {
+	var out []map[string]any
+	const key = `"authToken":"`
+	for offset := 0; ; {
+		idx := strings.Index(text[offset:], key)
+		if idx < 0 {
+			return out
+		}
+		pos := offset + idx
+		offset = pos + len(key)
+		low := pos - gatewayScanWindow
+		if low < 0 {
+			low = 0
+		}
+		for start := pos; ; {
+			start = strings.LastIndexByte(text[low:start], '{')
+			if start < 0 {
+				break
+			}
+			start += low
+			var obj map[string]any
+			if json.NewDecoder(strings.NewReader(text[start:])).Decode(&obj) == nil {
+				if _, ok := obj["authToken"].(string); ok {
+					out = append(out, obj)
+					break
+				}
+			}
+		}
 	}
-	wsURL := opts.WSURL
-	if wsURL == "" {
-		wsURL = "wss://" + lbHost + wsPath + "?" + params.Encode()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
 	}
-	return &Session{VMID: vmID, Endpoint: endpoint, AuthToken: authToken, AccessToken: accessToken, Notary: notary, WSURL: wsURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
+	return ""
+}
+
+// fetchPage loads a document the way a browser navigation does and returns
+// the HTML plus the route Next.js matched (signed-out pages rewrite to
+// /oidc/logged-out).
+func (o *SessionOptions) fetchPage(ctx context.Context, path string) (string, string, error) {
+	endpoint := strings.TrimRight(o.BaseURL.String(), "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Cookie", cookieHeader(o.Cookies))
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("User-Agent", chromeUserAgent)
+
+	resp, err := o.Client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	o.absorbCookies(resp)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, gatewayPageMaxSize))
+	if err != nil {
+		return "", "", err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", "", &AuthError{Status: resp.StatusCode, Body: truncate(body, 180)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("GET %s: upstream HTTP %d %s", path, resp.StatusCode, truncate(body, 180))
+	}
+	return string(body), resp.Header.Get("X-Matched-Path"), nil
+}
+
+// absorbCookies writes rotated session cookies back into the options.
+func (o *SessionOptions) absorbCookies(resp *http.Response) {
+	if o.Cookies == nil {
+		o.Cookies = map[string]string{}
+	}
+	if o.CookieExpiry == nil {
+		o.CookieExpiry = map[string]int64{}
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "" || cookie.Value == "" {
+			continue
+		}
+		o.Cookies[cookie.Name] = cookie.Value
+		switch {
+		case cookie.MaxAge > 0:
+			o.CookieExpiry[cookie.Name] = time.Now().Add(time.Duration(cookie.MaxAge) * time.Second).Unix()
+		case cookie.MaxAge < 0:
+			delete(o.CookieExpiry, cookie.Name)
+		case !cookie.Expires.IsZero():
+			o.CookieExpiry[cookie.Name] = cookie.Expires.Unix()
+		}
+	}
 }
 
 func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, body any, accessToken string) (map[string]any, error) {
@@ -216,30 +374,14 @@ func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, b
 	req.Header.Set("Priority", "u=4")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", chromeUserAgent)
 
 	resp, err := o.Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if o.CookieExpiry == nil {
-		o.CookieExpiry = map[string]int64{}
-	}
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "" || cookie.Value == "" {
-			continue
-		}
-		o.Cookies[cookie.Name] = cookie.Value
-		switch {
-		case cookie.MaxAge > 0:
-			o.CookieExpiry[cookie.Name] = time.Now().Add(time.Duration(cookie.MaxAge) * time.Second).Unix()
-		case cookie.MaxAge < 0:
-			delete(o.CookieExpiry, cookie.Name)
-		case !cookie.Expires.IsZero():
-			o.CookieExpiry[cookie.Name] = cookie.Expires.Unix()
-		}
-	}
+	o.absorbCookies(resp)
 	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return nil, &AuthError{Status: resp.StatusCode, Body: truncate(payload, 180)}
@@ -254,17 +396,24 @@ func (o *SessionOptions) requestJSON(ctx context.Context, method, path string, b
 	return out, nil
 }
 
-func (o *SessionOptions) wakeVM(ctx context.Context, vmID, accessToken string) error {
-	attempt := make([]byte, 16)
-	if _, err := rand.Read(attempt); err != nil {
-		return err
-	}
+// wakeVM mirrors the web client's wake request: cookie-authenticated, no
+// bearer token.
+func (o *SessionOptions) wakeVM(ctx context.Context, vmID string) error {
 	_, err := o.requestJSON(ctx, http.MethodPost, "/api/hatch/vm/wake", map[string]any{
 		"vm_id":              vmID,
 		"retry_count":        0,
-		"connect_attempt_id": hex.EncodeToString(attempt),
-	}, accessToken)
+		"connect_attempt_id": randomUUID(),
+		"wake_trigger":       "mount",
+	}, "")
 	return err
+}
+
+func randomUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func cookieHeader(cookies map[string]string) string {
@@ -287,8 +436,8 @@ func asString(v any) string {
 	return s
 }
 
-// AuthError marks an upstream 401/403; the bootstrap retries once after
-// refreshing the session because a stale hatch_vml cookie is the usual cause.
+// AuthError marks an upstream 401/403 so account code can classify it as an
+// expired session.
 type AuthError struct {
 	Status int
 	Body   string

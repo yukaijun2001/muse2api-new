@@ -125,26 +125,8 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 		}
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/auth/check", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("auth/check method = %s", r.Method)
-		}
-		_, _ = io.WriteString(w, `{"access_token":"access"}`)
-	})
-	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"vm_id":"vm1","endpoint_url":"https://vm1","vm_state":"RUNNING"}`))
-	})
-	mux.HandleFunc("/api/hatch/token", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer access" {
-			t.Errorf("hatch/token Authorization = %q", got)
-		}
-		_, _ = w.Write([]byte(`{"token":"token"}`))
-	})
-	mux.HandleFunc("/api/hatch/noise-notary-token", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer access" {
-			t.Errorf("noise-notary Authorization = %q", got)
-		}
-		_, _ = w.Write([]byte(`{"notaryToken":"notary"}`))
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, gatewayTestPage(t, "RUNNING", "assigned"))
 	})
 	mux.HandleFunc("/v1/noise", func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)

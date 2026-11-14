@@ -347,9 +347,9 @@ curl http://127.0.0.1:18610/v1/videos \
 生成链路和 Muse 自己的 web 客户端一致：
 
 ```text
-HTTP bootstrap: /api/auth/check → access_token → /api/session → VM 唤醒 → /api/hatch/token（Bearer access_token）→ /api/hatch/noise-notary-token
-WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&app_id=hatch-web
-TLS:            Chrome ClientHello 指纹；校验证书链
+HTTP bootstrap: GET /（登录态首页内嵌 __HATCH_GATEWAY_INIT__：vm、authToken、noiseNotaryToken、vmState）→ 未 RUNNING 时 /api/hatch/vm/wake
+WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&notary_token=...&app_id=hatch-web&app_version=1&request_id=<uuid>
+TLS:            Chrome ClientHello 指纹（ALPN 固定 http/1.1）；校验证书链
 加密:           Noise_XX_25519_AESGCM_SHA256（X25519 + HKDF + AES-GCM，4+8 字节 big-endian nonce）
 帧:             NoiseTransportFrame → ServiceFrame → ApplicationRequest/ApplicationResponse
 应用层:         读取 GET /chat/history 基线 → POST /chat/stream → 轮询 GET /chat/history
@@ -410,7 +410,7 @@ Cookie 过期了。重新在自己的浏览器里登录 Muse，再更新账号�
 
 **接口返回 503，说能力不可用？**
 
-看日志里的 `/api/session`、`/api/hatch/token` 和 Noise 握手错误。常见原因：Cookie 过期（401）、`hatch_vml` 失效（403，重新导入账号即可）、VM 唤醒超时。
+看日志里的首页网关引导（`__HATCH_GATEWAY_INIT__`）、`/api/hatch/vm/wake` 和 Noise 握手错误。常见原因：Cookie 过期（首页回落到登录页）、账号未分配 VM（`assignment=...`）、VM 唤醒超时。
 
 **Nginx 后面的 SSE 不实时？**
 
