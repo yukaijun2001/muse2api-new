@@ -70,6 +70,20 @@ cd /opt/muse2api
 
 ### 方式一：Docker Compose
 
+#### 服务器一键部署
+
+在 Debian/Ubuntu 服务器的交互式终端执行下面命令。脚本会安装 Docker（若缺失）、拉取 GitHub 最新 `master`、生成 API 与加密密钥，使用 Docker Compose 在 `10002` 端口启动，并尝试检测公网 IP。首次运行时会安全地提示输入管理员密码；密码和生成的密钥只保存在服务器 `deploy/secrets/` 中，不会写入 Git。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yukaijun2001/muse2api-new/master/deploy.sh | sudo bash
+```
+
+后台地址会在部署结束时打印，管理员账号为 `sys_wutong`。更新时可在服务器项目目录再次运行 `sudo bash deploy.sh`。首次运行生成的 secrets 会保留，后续更新不会更改管理员密码或已有数据。公网直连使用 HTTP；生产环境建议配置 HTTPS 反向代理，并在云厂商安全组中开放对应端口。
+
+也可以先克隆仓库，再从项目根目录运行 `sudo bash deploy.sh`。
+
+#### 手动 Docker Compose 部署
+
 ```bash
 cp .env.example .env
 

@@ -14,7 +14,7 @@ services:
     # Override only when the host data directory is owned by another UID/GID.
     user: "${MUSE2API_UID:-10001}:${MUSE2API_GID:-10001}"
     ports:
-      - "${MUSE2API_BIND:-127.0.0.1}:18610:18610"
+      - "${MUSE2API_BIND:-127.0.0.1}:${MUSE2API_HTTP_PORT:-18610}:18610"
     environment:
       # Secrets: *_FILE wins over the direct value. Use Docker secrets with
       # deploy/docker-compose.secrets.yml in production.
