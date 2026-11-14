@@ -96,7 +96,10 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 	endpoint := asString(info["endpoint_url"])
 	state := asString(info["vm_state"])
 	if vmID == "" || endpoint == "" {
-		return nil, fmt.Errorf("muse.ai did not assign a VM (status=%v)", info["status"])
+		// Keep the whole reply: newer deployments explain unassigned VMs
+		// (capacity, CVM migration, claim state) in fields beyond status.
+		raw, _ := json.Marshal(info)
+		return nil, fmt.Errorf("muse.ai did not assign a VM (status=%v): %s", info["status"], truncate(raw, 400))
 	}
 
 	if !strings.EqualFold(state, "RUNNING") {

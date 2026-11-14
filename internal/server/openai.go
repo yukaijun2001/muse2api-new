@@ -897,7 +897,7 @@ var (
 	secretParamRe  = regexp.MustCompile(`(?i)((?:auth_token|notary_token|access_token|token)=)[^&\s"']+`)
 	bearerTokenRe  = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+`)
 	secretFieldRe  = regexp.MustCompile(`(?i)("(?:access_token|accessToken|token|notaryToken|auth_token)"\s*:\s*")[^"]*`)
-	maxDetailRunes = 240
+	maxDetailRunes = 480
 )
 
 func redactUpstreamDetail(message string) string {
