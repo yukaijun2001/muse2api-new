@@ -67,7 +67,9 @@ func TestChromeWSDialerUsesChromeHelloAndVerifiesCertificate(t *testing.T) {
 	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER}, PrivateKey: serverKey, Leaf: leaf}},
 		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"},
+		// The production gateway prefers h2; the WebSocket dialer must still
+		// land on http/1.1.
+		NextProtos: []string{"h2", "http/1.1"},
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			observedHello <- hello
 			return nil, nil
@@ -100,10 +102,16 @@ func TestChromeWSDialerUsesChromeHelloAndVerifiesCertificate(t *testing.T) {
 	if len(state.VerifiedChains) == 0 || state.VerifiedChains[0][0].Subject.CommonName != "localhost" || !state.VerifiedChains[0][len(state.VerifiedChains[0])-1].Equal(root) {
 		t.Fatal("server certificate chain was not verified by the configured root")
 	}
+	if state.NegotiatedProtocol != "http/1.1" {
+		t.Fatalf("negotiated ALPN = %q, want http/1.1", state.NegotiatedProtocol)
+	}
 	select {
 	case hello := <-observedHello:
 		if hello.ServerName != "localhost" {
 			t.Fatalf("SNI = %q", hello.ServerName)
+		}
+		if len(hello.SupportedProtos) != 1 || hello.SupportedProtos[0] != "http/1.1" {
+			t.Fatalf("offered ALPN = %v, want [http/1.1]", hello.SupportedProtos)
 		}
 		tls13Offered := false
 		for _, version := range hello.SupportedVersions {

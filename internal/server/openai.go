@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -194,6 +195,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, prompt, mode
 	}
 	text, err := collectChat(ctx, events)
 	if err != nil {
+		s.log.Warn("chat failed", "task", taskRecord.ID, "error", err)
 		finish(model.TaskFailed, err)
 		apierr.Write(w, r, mapDriverError(err))
 		return
@@ -279,6 +281,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, events <-cha
 			}
 			if e.Err != nil {
 				outcome, outcomeErr = model.TaskFailed, e.Err
+				s.log.Warn("chat stream failed", "task", taskID, "error", e.Err)
 				if responses {
 					send("response.failed", map[string]any{"type": "response.failed", "response": responseEnvelope(id, created, modelName, "failed", full)})
 				} else {
@@ -881,5 +884,29 @@ func mapDriverError(err error) error {
 		}
 		return apierr.New(status, "upstream_error", safeUpstreamError(err))
 	}
-	return apierr.New(502, "upstream_error", "上游请求失败")
+	detail := redactUpstreamDetail(err.Error())
+	if detail == "" {
+		return apierr.New(502, "upstream_error", "上游请求失败")
+	}
+	return apierr.New(502, "upstream_error", "上游请求失败："+detail)
+}
+
+// Upstream errors can quote gateway URLs and auth headers. Keep the reason
+// readable for operators but never echo tokens back to API clients.
+var (
+	secretParamRe  = regexp.MustCompile(`(?i)((?:auth_token|notary_token|access_token|token)=)[^&\s"']+`)
+	bearerTokenRe  = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+`)
+	secretFieldRe  = regexp.MustCompile(`(?i)("(?:access_token|accessToken|token|notaryToken|auth_token)"\s*:\s*")[^"]*`)
+	maxDetailRunes = 240
+)
+
+func redactUpstreamDetail(message string) string {
+	message = strings.TrimSpace(message)
+	message = secretParamRe.ReplaceAllString(message, "${1}***")
+	message = bearerTokenRe.ReplaceAllString(message, "${1}***")
+	message = secretFieldRe.ReplaceAllString(message, "${1}***")
+	if runes := []rune(message); len(runes) > maxDetailRunes {
+		message = string(runes[:maxDetailRunes]) + "..."
+	}
+	return message
 }

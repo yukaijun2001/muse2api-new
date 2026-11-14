@@ -55,11 +55,28 @@ func (d *chromeTLSDialer) DialContext(ctx context.Context, network, address stri
 		_ = raw.Close()
 		return nil, fmt.Errorf("parse websocket server address: %w", err)
 	}
+	// The Chrome preset's ALPN extension overrides Config.NextProtos and offers
+	// h2 first. The gateway then negotiates h2 and rejects the HTTP/1.1 upgrade
+	// gorilla writes, so pin ALPN to http/1.1 as Chrome does for WebSockets.
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("Chrome TLS preset: %w", err)
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
 	tlsConn := utls.UClient(raw, &utls.Config{
 		ServerName: serverName,
 		RootCAs:    d.roots,
 		NextProtos: []string{"http/1.1"},
-	}, utls.HelloChrome_Auto)
+	}, utls.HelloCustom)
+	if err := tlsConn.ApplyPreset(&spec); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("Chrome TLS preset: %w", err)
+	}
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("Chrome TLS handshake: %w", err)

@@ -630,3 +630,16 @@ func TestImageTaskRejectsBadReferenceBeforeQueue(t *testing.T) {
 		t.Fatalf("task created before reference validation: %+v", tasks)
 	}
 }
+
+func TestMapDriverErrorKeepsRedactedReason(t *testing.T) {
+	err := mapDriverError(errors.New(`gateway dial: malformed HTTP status code "error" (wss://hatch.metaaivm.com/v1/noise?vm_id=v1&auth_token=secret-a&notary_token=secret-b) Bearer secret-c {"access_token":"secret-d"}`))
+	message := err.Error()
+	if !strings.Contains(message, "上游请求失败：gateway dial: malformed HTTP status code") {
+		t.Fatalf("reason was dropped: %q", message)
+	}
+	for _, secret := range []string{"secret-a", "secret-b", "secret-c", "secret-d"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("message leaked %s: %q", secret, message)
+		}
+	}
+}
