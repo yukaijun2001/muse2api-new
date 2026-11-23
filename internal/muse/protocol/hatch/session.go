@@ -97,14 +97,20 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 		return nil, err
 	}
 
+	if err := vmStateUnusable(init.VMID, init.VMState); err != nil {
+		return nil, err
+	}
 	if !strings.EqualFold(init.VMState, "RUNNING") {
 		// The web client requests a wake on mount whenever the VM is not
-		// known to be running. An unknown state is not fatal: try the gateway.
-		if err := opts.wakeVM(ctx, init.VMID); err != nil && init.VMState != "" {
+		// known to be running. UNKNOWN (or no state) is what the page reports
+		// when muse.ai could not read the live state; the browser connects to
+		// the gateway anyway, so only a known transitional state is waited on.
+		if err := opts.wakeVM(ctx, init.VMID); err != nil && vmStateNeedsWait(init.VMState) {
 			return nil, err
 		}
+		waited := false
 		deadline := time.Now().Add(45 * time.Second)
-		for init.VMState != "" && !strings.EqualFold(init.VMState, "RUNNING") {
+		for vmStateNeedsWait(init.VMState) {
 			if time.Now().After(deadline) {
 				return nil, fmt.Errorf("VM %s did not become RUNNING (state=%s)", init.VMID, init.VMState)
 			}
@@ -113,16 +119,22 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 				return nil, ctx.Err()
 			case <-time.After(1500 * time.Millisecond):
 			}
+			waited = true
 			// Re-read the page: it carries the live state and fresh tokens.
 			if next, err := opts.loadGatewayInit(ctx); err == nil {
 				init = next
 			}
+			if err := vmStateUnusable(init.VMID, init.VMState); err != nil {
+				return nil, err
+			}
 		}
-		// Let the VM's noise listener bind after a wake.
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(1200 * time.Millisecond):
+		if waited {
+			// Let the VM's noise listener bind after a wake.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(1200 * time.Millisecond):
+			}
 		}
 	}
 
@@ -135,6 +147,32 @@ func Bootstrap(ctx context.Context, opts SessionOptions) (*Session, error) {
 		}
 	}
 	return &Session{VMID: init.VMID, Endpoint: init.GatewayURL, AuthToken: init.AuthToken, Notary: init.NotaryToken, WSURL: wsURL, FallbackWSURL: fallbackWSURL, Cookies: opts.Cookies, CookieExpiry: opts.CookieExpiry}, nil
+}
+
+// VM states come from the web bundle's state enum: UNKNOWN, CREATING,
+// RUNNING, STOPPED, DELETING, ERROR, SUSPENDED, UPDATING, DISABLED and the
+// CVM_* migration states.
+
+// vmStateNeedsWait reports transitional states a wake resolves on its own.
+func vmStateNeedsWait(state string) bool {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "STOPPED", "SUSPENDED", "CREATING", "UPDATING", "CVM_DST_VM_STARTING":
+		return true
+	default:
+		return false
+	}
+}
+
+// vmStateUnusable fails fast on states no wake can fix, instead of waiting
+// out the wake deadline.
+func vmStateUnusable(vmID, state string) error {
+	switch normalized := strings.ToUpper(strings.TrimSpace(state)); normalized {
+	case "ERROR", "DELETING", "DISABLED", "CVM_DST_VM_FAILED_TO_START", "CVM_LOCKED":
+		return fmt.Errorf("VM %s is %s on muse.ai; open muse.ai in a browser to recover it", vmID, normalized)
+	case "CVM_AWAITING_DST_VM_CHIP_SELECTION":
+		return fmt.Errorf("VM %s is waiting for a migration choice (%s); finish it on muse.ai in a browser", vmID, normalized)
+	}
+	return nil
 }
 
 // gatewayWSURL builds the admission URL with the web client's parameter order.
@@ -243,9 +281,18 @@ func parseGatewayInit(page string) *gatewayInit {
 			init.Assignment = assignment
 			init.Issue = obj["vmResolutionIssue"]
 		}
-		if state := asString(obj["vmState"]); state != "" && rank(obj) < stateRank {
+		// A live reading beats a cached one; the early bootstrap script
+		// carries no state of its own, so it ranks last here.
+		statePriority := 2
+		switch {
+		case asString(obj["vmStateSource"]) == "live":
+			statePriority = 0
+		case rank(obj) == 1:
+			statePriority = 1
+		}
+		if state := asString(obj["vmState"]); state != "" && statePriority < stateRank {
 			init.VMState = state
-			stateRank = rank(obj)
+			stateRank = statePriority
 		}
 		if rank(obj) == 1 && init.AltAuthToken == "" {
 			init.AltAuthToken = strings.TrimSpace(asString(obj["authToken"]))

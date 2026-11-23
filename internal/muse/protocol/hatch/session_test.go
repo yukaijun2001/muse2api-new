@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"muse2api/internal/muse/protocol"
 )
@@ -192,6 +193,91 @@ func TestBootstrapWakesStoppedVMUntilRunning(t *testing.T) {
 	defer mu.Unlock()
 	if !woken || pages != 2 || session.VMID != "vm1" {
 		t.Fatalf("woken=%v pages=%d session=%+v", woken, pages, session)
+	}
+}
+
+func TestBootstrapDoesNotWaitForUnknownVMState(t *testing.T) {
+	var wakeRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, gatewayTestPage(t, "UNKNOWN", "assigned"))
+		case "/api/hatch/vm/wake":
+			wakeRequests++
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"wake_requested"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	session, err := Bootstrap(ctx, SessionOptions{
+		BaseURL: base,
+		Client:  server.Client(),
+		Cookies: map[string]string{"hatch_sess": "session"},
+		WSURL:   "ws://example.invalid/v1/noise",
+	})
+	if err != nil {
+		t.Fatalf("Bootstrap with UNKNOWN vm_state: %v", err)
+	}
+	if time.Since(started) >= time.Second {
+		t.Fatalf("UNKNOWN vm_state blocked admission for %s", time.Since(started))
+	}
+	if wakeRequests != 1 || session.VMID != "vm1" {
+		t.Fatalf("wake requests=%d session=%+v", wakeRequests, session)
+	}
+}
+
+func TestBootstrapFailsFastOnUnusableVMState(t *testing.T) {
+	var wakeRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, gatewayTestPage(t, "ERROR", "assigned"))
+		case "/api/hatch/vm/wake":
+			wakeRequests++
+			_, _ = io.WriteString(w, `{"status":"wake_requested"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = Bootstrap(ctx, SessionOptions{BaseURL: base, Client: server.Client(), Cookies: map[string]string{"hatch_sess": "s"}})
+	if err == nil || !strings.Contains(err.Error(), "is ERROR") {
+		t.Fatalf("err = %v, want fast ERROR state failure", err)
+	}
+	if wakeRequests != 0 {
+		t.Fatalf("wake requests = %d, want none for an unusable VM", wakeRequests)
+	}
+}
+
+func TestParseGatewayInitPrefersAuthoritativeVMState(t *testing.T) {
+	page := gatewayTestPage(t, "RUNNING", "assigned")
+	page = strings.Replace(page,
+		`"sessionBindingId":"b"}`,
+		`"sessionBindingId":"b","vmState":"UNKNOWN"}`,
+		1)
+	init := parseGatewayInit(page)
+	if init == nil {
+		t.Fatal("parseGatewayInit returned nil")
+	}
+	if init.VMState != "RUNNING" {
+		t.Fatalf("vm state = %q, want authoritative RUNNING", init.VMState)
 	}
 }
 
