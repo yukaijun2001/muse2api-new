@@ -92,6 +92,8 @@ type Client struct {
 	// probe, when active, records raw chat.subscribe events during streaming
 	// turns (admin settings switch).
 	probe *ProbeRecorder
+	// push is the live chat.subscribe feed of the current connection.
+	push *pushFeed
 
 	// quotaActionID caches the Next.js server-action id that returns the
 	// subscription snapshot. The id is build-specific, so it is re-discovered
@@ -142,6 +144,7 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 		_ = c.conn.Close()
 		c.conn = nil
 		c.session = nil
+		c.push = nil
 		c.connKey = ""
 	}
 	session, err := Bootstrap(ctx, SessionOptions{
@@ -178,7 +181,14 @@ func (c *Client) connect(ctx context.Context, credentials map[string]string) (*C
 	c.conn = conn
 	c.session = session
 	c.connKey = key
+	c.push = c.startPush(ctx, conn)
 	return conn, nil
+}
+
+func (c *Client) currentPush() *pushFeed {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.push
 }
 
 func (c *Client) forgetConnection() {
@@ -188,6 +198,7 @@ func (c *Client) forgetConnection() {
 	}
 	c.conn = nil
 	c.session = nil
+	c.push = nil
 	c.connKey = ""
 	c.mu.Unlock()
 }
@@ -203,6 +214,7 @@ func (c *Client) invalidate() {
 	}
 	c.conn = nil
 	c.session = nil
+	c.push = nil
 	c.connKey = ""
 	c.mu.Unlock()
 }
@@ -826,9 +838,11 @@ type ChatDelta struct {
 	Err  error
 }
 
-// ChatStream sends a prompt on the account's main chat and polls chat.history
-// for the evolving assistant text. The turn is serialized because each account
-// has one main conversation.
+// ChatStream sends a prompt on the account's main chat and streams the reply.
+// Text comes from the connection's chat.subscribe feed as the model writes
+// it; chat.history polling runs alongside as the fallback (no subscription,
+// dropped records, failed turns) and as the completion check. The turn is
+// serialized because each account has one main conversation.
 func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, prompt string, timeout time.Duration) (<-chan ChatDelta, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -850,14 +864,17 @@ func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, 
 		return nil, fmt.Errorf("解析发送前对话历史: %w", err)
 	}
 	baseline := maxEventSeq(historyEvents(baselinePayload))
-	probe := c.startStreamProbe(ctx, conn, baseline)
+	feed := c.currentPush()
+	probe := c.startStreamProbe(baseline, feed != nil)
+	// Attach before sending so the reply's first delta cannot be missed.
+	listener, detach := feed.attach(probe.turnID())
 	body := map[string]any{
 		"items":        []any{ChatItem{Type: "text", Text: prompt}},
 		"node_id":      c.nodeID,
 		"capabilities": map[string]any{},
 	}
 	if err := conn.Send(ctx, http.MethodPost, "/chat/stream", body); err != nil {
-		probe.finish()
+		detach()
 		c.chatMu.Unlock()
 		return nil, err
 	}
@@ -866,85 +883,163 @@ func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, 
 	go func() {
 		defer close(out)
 		defer c.chatMu.Unlock()
-		defer probe.finish()
-		deadline := time.Now().Add(timeout)
+		defer func() { detach() }()
+		attached := feed
+		var pushCh <-chan map[string]any
+		if listener != nil {
+			pushCh = listener.ch
+		}
+		turn := &pushTurn{nodeID: c.nodeID, baseline: baseline}
 		poller := newStreamPoller(baseline)
-		var emitted string
-		for {
-			if ctx.Err() != nil {
-				return
+		reply := &replyText{}
+		deadline := time.NewTimer(timeout)
+		defer deadline.Stop()
+		pollTimer := time.NewTimer(poller.interval(pushCh != nil))
+		defer pollTimer.Stop()
+
+		send := func(delta ChatDelta) bool {
+			select {
+			case out <- delta:
+				return true
+			case <-ctx.Done():
+				return false
 			}
-			if time.Now().After(deadline) {
-				select {
-				case out <- ChatDelta{Err: fmt.Errorf("上游对话流超时: %w", protocol.ErrUpstreamTimeout)}:
-				case <-ctx.Done():
-				}
-				return
-			}
-			sleepCtx(ctx, poller.interval())
-			conn := c.currentConn()
-			if conn == nil {
-				// The gateway dropped mid-turn. Reconnect and keep reading
-				// history: the VM finishes the turn without us.
-				var err error
-				if conn, err = c.connect(ctx, credentials); err != nil {
-					if errors.Is(err, protocol.ErrSessionExpired) {
-						select {
-						case out <- ChatDelta{Err: err}:
-						case <-ctx.Done():
-						}
-						return
-					}
-					// Each attempt re-fetches the homepage; do not hammer it.
-					sleepCtx(ctx, time.Second)
-					continue
-				}
-			}
-			result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": poller.limit}, 20*time.Second)
-			if err != nil {
-				if conn.IsClosed() {
-					c.forgetConnection()
-				}
-				continue
-			}
-			var payload map[string]any
-			if err := result.JSON(&payload); err != nil {
-				continue
-			}
-			events := historyEvents(payload)
-			replies := assistantReplies(events, baseline)
-			poller.observe(events, replies)
-			text := latestAssistantText(replies)
-			if text == "" {
-				continue
-			}
-			delta := text
-			if strings.HasPrefix(text, emitted) {
-				delta = strings.TrimPrefix(text, emitted)
-			}
+		}
+		emit := func(source, delta string, finished bool) bool {
 			if delta != "" {
-				select {
-				case out <- ChatDelta{Text: delta}:
-					emitted = text
-				case <-ctx.Done():
-					return
+				if !send(ChatDelta{Text: delta}) {
+					return false
 				}
 				poller.progressed()
 			}
-			finished := assistantIsFinished(replies)
 			if delta != "" || finished {
-				probe.polled(len(delta), len(text), finished)
+				probe.emitted(source, len(delta), len(reply.text), finished)
 			}
-			if finished {
-				select {
-				case out <- ChatDelta{Done: true}:
-				case <-ctx.Done():
+			return true
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-deadline.C:
+				send(ChatDelta{Err: fmt.Errorf("上游对话流超时: %w", protocol.ErrUpstreamTimeout)})
+				return
+			case record, ok := <-pushCh:
+				if !ok || listener.overflow.Load() {
+					// Subscription closed or this turn lost records: finish
+					// on history polling.
+					pushCh = nil
+					continue
+				}
+				delta := reply.append(turn.apply(record))
+				if !turn.done {
+					if !emit("push", delta, false) {
+						return
+					}
+					continue
+				}
+				// message_done carries the full text; it also fills any gap.
+				delta += reply.extend(turn.final)
+				if !emit("push", delta, true) || !send(ChatDelta{Done: true}) {
+					return
 				}
 				return
+			case <-pollTimer.C:
+				text, finished, err := c.pollTurn(ctx, credentials, poller, baseline)
+				if err != nil {
+					send(ChatDelta{Err: err})
+					return
+				}
+				delta := reply.extend(text)
+				if !emit("poll", delta, finished) {
+					return
+				}
+				if finished {
+					send(ChatDelta{Done: true})
+					return
+				}
+				if pushCh == nil {
+					// A reconnect may have brought a fresh subscription. The
+					// same feed is not re-attached: this turn already lost
+					// records on it.
+					if fresh := c.currentPush(); fresh != nil && fresh != attached {
+						if l, d := fresh.attach(probe.turnID()); l != nil {
+							detach()
+							listener, detach, pushCh, attached = l, d, l.ch, fresh
+						}
+					}
+				}
+				pollTimer.Reset(poller.interval(pushCh != nil))
 			}
 		}
 	}()
 	return out, nil
+}
+
+// pollTurn reads the history tail once. It returns the newest reply text of
+// this turn and whether that reply is complete; transient failures return
+// empty text so the caller simply polls again.
+func (c *Client) pollTurn(ctx context.Context, credentials map[string]string, poller *streamPoller, baseline int64) (string, bool, error) {
+	conn := c.currentConn()
+	if conn == nil {
+		// The gateway dropped mid-turn. Reconnect and keep reading history:
+		// the VM finishes the turn without us.
+		var err error
+		if conn, err = c.connect(ctx, credentials); err != nil {
+			if errors.Is(err, protocol.ErrSessionExpired) {
+				return "", false, err
+			}
+			// Each attempt re-fetches the homepage; do not hammer it.
+			sleepCtx(ctx, time.Second)
+			return "", false, nil
+		}
+	}
+	result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": poller.limit}, 20*time.Second)
+	if err != nil {
+		if conn.IsClosed() {
+			c.forgetConnection()
+		}
+		return "", false, nil
+	}
+	var payload map[string]any
+	if err := result.JSON(&payload); err != nil {
+		return "", false, nil
+	}
+	events := historyEvents(payload)
+	replies := assistantReplies(events, baseline)
+	poller.observe(events, replies)
+	text := latestAssistantText(replies)
+	return text, text != "" && assistantIsFinished(replies), nil
+}
+
+// replyText is the text already sent to the client. Push deltas extend it
+// directly; full-text snapshots (history, message_done) only contribute the
+// part not sent yet. History trims surrounding whitespace, so a snapshot is
+// also matched against the sent text without its leading whitespace. A
+// snapshot that no longer starts with what was sent is ignored rather than
+// sent twice.
+type replyText struct{ text string }
+
+func (r *replyText) append(delta string) string {
+	r.text += delta
+	return delta
+}
+
+func (r *replyText) extend(snapshot string) string {
+	if snapshot == "" {
+		return ""
+	}
+	sent := r.text
+	if !strings.HasPrefix(snapshot, sent) {
+		sent = strings.TrimLeft(r.text, " \t\r\n")
+		if !strings.HasPrefix(snapshot, sent) {
+			return ""
+		}
+	}
+	delta := snapshot[len(sent):]
+	r.text += delta
+	return delta
 }
 
 // Streaming reads chat.history in a tight loop instead of subscribing, so
@@ -953,12 +1048,13 @@ func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, 
 // and the delay backs off only while nothing changes, e.g. while the model
 // is thinking or running a tool.
 const (
-	streamPollFast    = 120 * time.Millisecond
-	streamPollSlow    = 600 * time.Millisecond
-	streamIdleAfter   = 3 * time.Second
-	streamTailLimit   = 24
-	streamWideLimit   = 120
-	streamFirstPollIn = 250 * time.Millisecond
+	streamPollFast     = 120 * time.Millisecond
+	streamPollSlow     = 600 * time.Millisecond
+	streamIdleAfter    = 3 * time.Second
+	streamTailLimit    = 24
+	streamWideLimit    = 120
+	streamFirstPollIn  = 250 * time.Millisecond
+	streamPollWithPush = time.Second
 )
 
 type streamPoller struct {
@@ -975,11 +1071,15 @@ func newStreamPoller(baseline int64) *streamPoller {
 // interval is the pause before the next poll. The first one leaves the VM a
 // moment to accept the turn; after that, polls run back to back (plus the
 // gateway round trip) while text is flowing.
-func (p *streamPoller) interval() time.Duration {
+func (p *streamPoller) interval(push bool) time.Duration {
 	p.polls++
 	switch {
 	case p.polls == 1:
 		return streamFirstPollIn
+	case push:
+		// Text arrives over the subscription; history only confirms the end
+		// or covers a failed turn.
+		return streamPollWithPush
 	case time.Since(p.lastChange) > streamIdleAfter:
 		return streamPollSlow
 	default:

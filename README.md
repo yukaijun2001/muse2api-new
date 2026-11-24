@@ -363,7 +363,7 @@ WebSocket:      wss://hatch.metaaivm.com/v1/noise?vm_id=...&auth_token=...&notar
 TLS:            Chrome ClientHello 指纹（ALPN 固定 http/1.1）；校验证书链
 加密:           Noise_XX_25519_AESGCM_SHA256（X25519 + HKDF + AES-GCM，4+8 字节 big-endian nonce）
 帧:             NoiseTransportFrame → ServiceFrame → ApplicationRequest/ApplicationResponse
-应用层:         读取 GET /chat/history 基线 → POST /chat/stream → 轮询 GET /chat/history
+应用层:         连接时订阅 chat.subscribe（流式文字走 delta.text_append）→ 读取 GET /chat/history 基线 → POST /chat/stream → GET /chat/history 兜底与完成确认
                 媒体从 /media/raw 或 /fs/raw 下载
 额度:           POST /（Next-Action: fetchSubscriptionAction，React Flight 响应）
 ```

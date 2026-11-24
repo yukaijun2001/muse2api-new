@@ -1,34 +1,26 @@
 package hatch
 
 import (
-	"context"
 	"encoding/json"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
 
-// The stream probe records what chat.subscribe delivers during a real turn,
-// so push streaming can be rebuilt against the current wire format instead of
-// guessed. It only observes: replies still come from chat.history polling.
+// The stream probe records what chat.subscribe delivers and which path
+// (push or history polling) delivered each piece of a reply, so streaming
+// regressions can be diagnosed against the live wire format.
 //
 // It is switched on from the admin settings page, expires on its own and
 // keeps its records in memory only: they contain message text, so they are
 // never written to the service log and vanish on restart.
 const (
-	probeMaxTurnRecords = 400
-	probeMaxEntries     = 3000
-	probeRecordBytes    = 1200
-	probeGrace          = 3 * time.Second
-	ProbeDefaultTTL     = 30 * time.Minute
-	ProbeMaxTTL         = 2 * time.Hour
+	probeMaxEntries  = 3000
+	probeRecordBytes = 1200
+	ProbeDefaultTTL  = 30 * time.Minute
+	ProbeMaxTTL      = 2 * time.Hour
 )
-
-// probeCapabilities is what the web client declared when chat.subscribe was
-// last known to work.
-var probeCapabilities = []string{"chat_cancel", "delta_stream", "custom_reactions", "custom_reactions_facebook_thumbs_up_v1"}
 
 // ProbeEntry is one line of the downloadable probe log.
 type ProbeEntry struct {
@@ -137,123 +129,36 @@ type streamProbe struct {
 	recorder *ProbeRecorder
 	turn     int64
 	started  time.Time
-	done     chan struct{}
-	once     sync.Once
 }
 
 func (p *streamProbe) log(event string, fields map[string]any) {
+	if p == nil {
+		return
+	}
 	p.recorder.add(ProbeEntry{Time: time.Now().Format(time.RFC3339Nano), Turn: p.turn, MS: time.Since(p.started).Milliseconds(), Event: event, Fields: fields})
 }
 
-// startStreamProbe registers the node the way the web client does and opens
-// chat.subscribe before the turn is sent. It never fails the turn.
-func (c *Client) startStreamProbe(ctx context.Context, conn *Conn, baseline int64) *streamProbe {
+// startStreamProbe opens a probe turn. Subscription records themselves are
+// logged by the connection's push feed while the turn is attached.
+func (c *Client) startStreamProbe(baseline int64, push bool) *streamProbe {
 	if !c.probe.active() {
 		return nil
 	}
-	p := &streamProbe{recorder: c.probe, turn: c.probe.newTurn(), started: time.Now(), done: make(chan struct{})}
-	p.log("turn", map[string]any{"node_id": c.nodeID, "baseline_seq": baseline})
-	p.request(ctx, conn, "/api/nodes/register", map[string]any{
-		"node_id":      c.nodeID,
-		"display_name": "Web",
-		"platform":     "web",
-		"commands_v2":  map[string]any{"ping": map[string]any{"description": "Connection liveness check"}},
-	})
-	p.request(ctx, conn, "/client/register-capabilities", map[string]any{
-		"client_id":    c.nodeID,
-		"platform":     "web",
-		"display_name": "Muse Web",
-		"version":      "0.0.0",
-		"capabilities": map[string]any{
-			"data_sources":       map[string]any{},
-			"device_commands":    map[string]any{},
-			"hatch_app_commands": map[string]any{},
-			"rendering": map[string]any{
-				"supported_presentations":        []string{"text_with_button", "generic_list"},
-				"supported_inline_presentations": []string{"option"},
-				"supported_text_entities":        []string{},
-			},
-		},
-	})
-	params := map[string]any{"after_stream_seq": 0, "after_chat_event_seq": baseline, "capabilities": probeCapabilities}
-	sub, err := conn.OpenStream(ctx, "/chat/subscribe", params)
-	if err != nil {
-		p.log("subscribe_failed", map[string]any{"error": err.Error()})
-		return p
-	}
-	p.log("subscribed", map[string]any{"params": params})
-	// Outlive the HTTP request a little so trailing events are captured.
-	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-	go func() {
-		defer cancel()
-		p.read(readCtx, sub)
-	}()
+	p := &streamProbe{recorder: c.probe, turn: c.probe.newTurn(), started: time.Now()}
+	p.log("turn", map[string]any{"node_id": c.nodeID, "baseline_seq": baseline, "push": push})
 	return p
 }
 
-func (p *streamProbe) request(ctx context.Context, conn *Conn, path string, body map[string]any) {
-	started := time.Now()
-	result, err := conn.Request(ctx, http.MethodPost, path, body, 10*time.Second)
-	fields := map[string]any{"path": path, "rpc_ms": time.Since(started).Milliseconds()}
-	if err != nil {
-		fields["error"] = err.Error()
-	} else {
-		fields["status"] = result.Status
-		fields["body"] = probeBody(result.Body)
-	}
-	p.log("register", fields)
-}
-
-func (p *streamProbe) read(ctx context.Context, sub *StreamHandle) {
-	defer sub.Close()
-	count := 0
-	done := p.done
-	var grace <-chan time.Time
-	for {
-		select {
-		case <-ctx.Done():
-			p.log("stopped", map[string]any{"records": count, "reason": "context done"})
-			return
-		case <-done:
-			// Keep listening briefly: trailing events often land after the
-			// poller has seen the completed message.
-			done = nil
-			grace = time.After(probeGrace)
-		case <-grace:
-			p.log("stopped", map[string]any{"records": count, "reason": "turn finished"})
-			return
-		case record, ok := <-sub.Events():
-			if !ok {
-				fields := map[string]any{"records": count}
-				if err := sub.Err(); err != nil {
-					fields["error"] = err.Error()
-				}
-				p.log("stream_closed", fields)
-				return
-			}
-			count++
-			p.log("record", map[string]any{"n": count, "record": probeValue(record)})
-			if count >= probeMaxTurnRecords {
-				p.log("stopped", map[string]any{"records": count, "reason": "record cap"})
-				return
-			}
-		}
-	}
-}
-
-// polled records when the history poller emitted text, for timing comparison.
-func (p *streamProbe) polled(deltaLen, totalLen int, finished bool) {
+func (p *streamProbe) turnID() int64 {
 	if p == nil {
-		return
+		return 0
 	}
-	p.log("poll_delta", map[string]any{"delta_chars": deltaLen, "total_chars": totalLen, "finished": finished})
+	return p.turn
 }
 
-func (p *streamProbe) finish() {
-	if p == nil {
-		return
-	}
-	p.once.Do(func() { close(p.done) })
+// emitted records which path delivered text, for timing comparison.
+func (p *streamProbe) emitted(source string, deltaLen, totalLen int, finished bool) {
+	p.log(source+"_delta", map[string]any{"delta_chars": deltaLen, "total_chars": totalLen, "finished": finished})
 }
 
 // probeValue masks secrets and signed URL queries; oversized values are

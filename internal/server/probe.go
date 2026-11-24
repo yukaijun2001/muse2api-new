@@ -12,7 +12,7 @@ import (
 )
 
 // streamProber is implemented by drivers that can record chat.subscribe
-// traffic for debugging push streaming.
+// traffic for debugging streaming.
 type streamProber interface {
 	StreamProbe() *hatch.ProbeRecorder
 }

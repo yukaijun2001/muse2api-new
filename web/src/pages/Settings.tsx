@@ -247,7 +247,7 @@ function StreamProbePanel() {
       <div className="maintenance-icon"><Bug size={16} /></div>
       <div>
         <strong>流式探测 {data.enabled ? <span className="text-success">· 已开启，{until} 自动关闭</span> : <span>· 已关闭</span>}</strong>
-        <p>开启后，每次流式对话会额外订阅上游 chat.subscribe，记录原始事件与轮询出字的时间点，用于实现逐字推送。不影响返回内容。记录含对话原文（令牌、签名已打码），只保存在内存中，服务重启即清空。</p>
+        <p>开启后记录上游 chat.subscribe 推送的原始事件，以及每段文字是由推送还是轮询送出的，用于排查流式输出问题。不影响返回内容。记录含对话原文（令牌、签名已打码），只保存在内存中，服务重启即清空。</p>
         <p>已记录 {data.turns} 轮对话、{data.entries} 条事件。</p>
       </div>
       {data.enabled
