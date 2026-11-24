@@ -89,6 +89,9 @@ type Client struct {
 	nodeID     string
 	// proxy is the account egress proxy this client's transport was built for.
 	proxy string
+	// probe, when active, records raw chat.subscribe events during streaming
+	// turns (admin settings switch).
+	probe *ProbeRecorder
 
 	// quotaActionID caches the Next.js server-action id that returns the
 	// subscription snapshot. The id is build-specific, so it is re-discovered
@@ -847,87 +850,165 @@ func (c *Client) ChatStream(ctx context.Context, credentials map[string]string, 
 		return nil, fmt.Errorf("解析发送前对话历史: %w", err)
 	}
 	baseline := maxEventSeq(historyEvents(baselinePayload))
+	probe := c.startStreamProbe(ctx, conn, baseline)
 	body := map[string]any{
 		"items":        []any{ChatItem{Type: "text", Text: prompt}},
 		"node_id":      c.nodeID,
 		"capabilities": map[string]any{},
 	}
 	if err := conn.Send(ctx, http.MethodPost, "/chat/stream", body); err != nil {
+		probe.finish()
 		c.chatMu.Unlock()
 		return nil, err
 	}
 
 	out := make(chan ChatDelta, 64)
-	ticker := time.NewTicker(pollInterval)
-	var emitted string
-	var lastText string
-	var stableAt time.Time
 	go func() {
 		defer close(out)
 		defer c.chatMu.Unlock()
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
+		defer probe.finish()
+		deadline := time.Now().Add(timeout)
+		poller := newStreamPoller(baseline)
+		var emitted string
 		for {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return
-			case <-timer.C:
+			}
+			if time.Now().After(deadline) {
 				select {
 				case out <- ChatDelta{Err: fmt.Errorf("上游对话流超时: %w", protocol.ErrUpstreamTimeout)}:
 				case <-ctx.Done():
 				}
 				return
-			case <-ticker.C:
-				conn := c.currentConn()
-				if conn == nil {
-					continue
-				}
-				result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": 120}, 20*time.Second)
-				if err != nil {
-					if conn.IsClosed() {
-						c.forgetConnection()
-					}
-					continue
-				}
-				var payload map[string]any
-				if err := result.JSON(&payload); err != nil {
-					continue
-				}
-				replies := assistantReplies(historyEvents(payload), baseline)
-				text := latestAssistantText(replies)
-				if text == "" {
-					continue
-				}
-				now := time.Now()
-				if text != lastText {
-					lastText = text
-					stableAt = now
-				} else if stableAt.IsZero() {
-					stableAt = now
-				}
-				delta := text
-				if strings.HasPrefix(text, emitted) {
-					delta = strings.TrimPrefix(text, emitted)
-				}
-				if delta != "" {
-					select {
-					case out <- ChatDelta{Text: delta}:
-						emitted = text
-					case <-ctx.Done():
+			}
+			sleepCtx(ctx, poller.interval())
+			conn := c.currentConn()
+			if conn == nil {
+				// The gateway dropped mid-turn. Reconnect and keep reading
+				// history: the VM finishes the turn without us.
+				var err error
+				if conn, err = c.connect(ctx, credentials); err != nil {
+					if errors.Is(err, protocol.ErrSessionExpired) {
+						select {
+						case out <- ChatDelta{Err: err}:
+						case <-ctx.Done():
+						}
 						return
 					}
+					// Each attempt re-fetches the homepage; do not hammer it.
+					sleepCtx(ctx, time.Second)
+					continue
 				}
-				if assistantIsFinished(replies) {
-					select {
-					case out <- ChatDelta{Done: true}:
-					case <-ctx.Done():
-					}
+			}
+			result, err := conn.Request(ctx, http.MethodGet, "/chat/history", map[string]any{"limit": poller.limit}, 20*time.Second)
+			if err != nil {
+				if conn.IsClosed() {
+					c.forgetConnection()
+				}
+				continue
+			}
+			var payload map[string]any
+			if err := result.JSON(&payload); err != nil {
+				continue
+			}
+			events := historyEvents(payload)
+			replies := assistantReplies(events, baseline)
+			poller.observe(events, replies)
+			text := latestAssistantText(replies)
+			if text == "" {
+				continue
+			}
+			delta := text
+			if strings.HasPrefix(text, emitted) {
+				delta = strings.TrimPrefix(text, emitted)
+			}
+			if delta != "" {
+				select {
+				case out <- ChatDelta{Text: delta}:
+					emitted = text
+				case <-ctx.Done():
 					return
 				}
+				poller.progressed()
+			}
+			finished := assistantIsFinished(replies)
+			if delta != "" || finished {
+				probe.polled(len(delta), len(text), finished)
+			}
+			if finished {
+				select {
+				case out <- ChatDelta{Done: true}:
+				case <-ctx.Done():
+				}
+				return
 			}
 		}
 	}()
 	return out, nil
+}
+
+// Streaming reads chat.history in a tight loop instead of subscribing, so
+// its cadence is what the client perceives as token speed. Each poll asks
+// for a short tail of the history (only the newest assistant event matters)
+// and the delay backs off only while nothing changes, e.g. while the model
+// is thinking or running a tool.
+const (
+	streamPollFast    = 120 * time.Millisecond
+	streamPollSlow    = 600 * time.Millisecond
+	streamIdleAfter   = 3 * time.Second
+	streamTailLimit   = 24
+	streamWideLimit   = 120
+	streamFirstPollIn = 250 * time.Millisecond
+)
+
+type streamPoller struct {
+	baseline   int64
+	limit      int
+	polls      int
+	lastChange time.Time
+}
+
+func newStreamPoller(baseline int64) *streamPoller {
+	return &streamPoller{baseline: baseline, limit: streamTailLimit, lastChange: time.Now()}
+}
+
+// interval is the pause before the next poll. The first one leaves the VM a
+// moment to accept the turn; after that, polls run back to back (plus the
+// gateway round trip) while text is flowing.
+func (p *streamPoller) interval() time.Duration {
+	p.polls++
+	switch {
+	case p.polls == 1:
+		return streamFirstPollIn
+	case time.Since(p.lastChange) > streamIdleAfter:
+		return streamPollSlow
+	default:
+		return streamPollFast
+	}
+}
+
+func (p *streamPoller) progressed() { p.lastChange = time.Now() }
+
+// observe widens the history window for the rest of the turn when a full
+// short page holds no reply yet but does not reach back to the baseline: tool
+// events may have pushed the assistant message out of the tail.
+func (p *streamPoller) observe(events, replies []map[string]any) {
+	if p.limit >= streamWideLimit || len(replies) > 0 || len(events) < p.limit {
+		return
+	}
+	if minEventSeq(events) > p.baseline+1 {
+		p.limit = streamWideLimit
+	}
+}
+
+func minEventSeq(events []map[string]any) int64 {
+	var min int64
+	for _, event := range events {
+		if seq, ok := event["seq"].(float64); ok && (min == 0 || int64(seq) < min) {
+			min = int64(seq)
+		}
+	}
+	return min
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

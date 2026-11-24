@@ -59,6 +59,10 @@ type Driver struct {
 	// account's turn on another account's connection.
 	clientsMu sync.Mutex
 	clients   map[string]*Client
+
+	// probe is the admin-switchable chat.subscribe recorder shared by all
+	// account clients.
+	probe *ProbeRecorder
 }
 
 func NewDriver(cfg DriverConfig, store AccountStore) *Driver {
@@ -77,7 +81,7 @@ func NewDriver(cfg DriverConfig, store AccountStore) *Driver {
 	if cfg.MaxMediaBytes <= 0 {
 		cfg.MaxMediaBytes = 512 << 20
 	}
-	return &Driver{cfg: cfg, store: store, clients: map[string]*Client{}}
+	return &Driver{cfg: cfg, store: store, clients: map[string]*Client{}, probe: NewProbeRecorder()}
 }
 
 // clientFor returns the per-account protocol client, creating it on first use.
@@ -97,6 +101,7 @@ func (d *Driver) clientFor(creds protocol.AccountCredentials) *Client {
 	httpClient, wsDialer := d.transportFor(creds.Proxy)
 	client := NewClientWithWSURL(d.cfg.SiteURL, httpClient, d.cfg.WSURL)
 	client.SetWSDialer(wsDialer)
+	client.SetStreamProbe(d.probe)
 	client.proxy = creds.Proxy
 	d.clients[creds.ID] = client
 	return client
@@ -410,6 +415,9 @@ func (d *Driver) Close() error {
 	}
 	return nil
 }
+
+// StreamProbe exposes the chat.subscribe recorder to the admin API.
+func (d *Driver) StreamProbe() *ProbeRecorder { return d.probe }
 
 // InvalidateAccount drops the cached gateway connection for one account. The
 // next task re-bootstraps with the current cookies.

@@ -22,6 +22,12 @@ import (
 // the fake gateway received. Tests in this package do not run in parallel.
 var gatewayImageItems []map[string]any
 
+// gatewayHistoryLimits records the limit of every chat.history request.
+var gatewayHistoryLimits []string
+
+// gatewayPaths records every RPC path the fake gateway received.
+var gatewayPaths []string
+
 func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 	t.Helper()
 	var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -75,7 +81,12 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 			}
 			_, path, body := parseTestRequest(frame.Request)
 			basePath := strings.SplitN(path, "?", 2)[0]
+			gatewayPaths = append(gatewayPaths, basePath)
 			switch basePath {
+			case "/chat/subscribe":
+				sendTestResponse(ws, tx, frame.StreamID, 200, []byte(`{"event":"delta.text_append","payload":{"text":"hel"},"auth_token":"probe-secret"}`+"\n"), false)
+				sendTestBody(ws, tx, frame.StreamID, []byte(`{"event":"delta.message_done","payload":{"url":"https://cdn.example/x.png?sig=probe-secret"}}`+"\n"), false)
+				continue
 			case "/chat/stream":
 				var request map[string]any
 				if err := json.Unmarshal(body, &request); err != nil {
@@ -108,6 +119,9 @@ func startChatGateway(t *testing.T, silent bool) (*httptest.Server, string) {
 				turnSent = true
 				continue
 			case "/chat/history":
+				if parsed, err := url.Parse(path); err == nil {
+					gatewayHistoryLimits = append(gatewayHistoryLimits, parsed.Query().Get("limit"))
+				}
 				history := `{"chat_events":[]}`
 				if turnSent && (chatPrompt == "draw" || !silent) {
 					historyPolls++
@@ -174,6 +188,129 @@ func TestChatStreamIntegration(t *testing.T) {
 	}
 	if text != "hello" || !done {
 		t.Fatalf("text=%q done=%v", text, done)
+	}
+}
+
+func TestChatStreamPollsShortTailQuickly(t *testing.T) {
+	server, wsURL := startChatGateway(t, false)
+	client := NewClientWithWSURL(mustURL(t, server.URL), server.Client(), wsURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	gatewayHistoryLimits = nil
+	started := time.Now()
+	events, err := client.ChatStream(ctx, map[string]string{"hatch_sess": "s"}, "hi", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunks []string
+	for delta := range events {
+		if delta.Err != nil {
+			t.Fatalf("stream error: %v", delta.Err)
+		}
+		if delta.Text != "" {
+			chunks = append(chunks, delta.Text)
+		}
+	}
+	elapsed := time.Since(started)
+	// The fake turn needs two polls (running "hel", then completed "hello").
+	// The old 500 ms ticker took over a second; the tight loop needs ~0.4 s.
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("stream took %s", elapsed)
+	}
+	if strings.Join(chunks, "|") != "hel|lo" {
+		t.Fatalf("chunks = %q", chunks)
+	}
+	if len(gatewayHistoryLimits) < 3 || gatewayHistoryLimits[0] != "1" {
+		t.Fatalf("history limits = %v", gatewayHistoryLimits)
+	}
+	for _, limit := range gatewayHistoryLimits[1:] {
+		if limit != "24" {
+			t.Fatalf("stream poll limit = %s, want short tail 24 (all: %v)", limit, gatewayHistoryLimits)
+		}
+	}
+}
+
+func TestStreamPollerWidensWhenReplyMayBeOutOfWindow(t *testing.T) {
+	poller := newStreamPoller(10)
+	tail := make([]map[string]any, streamTailLimit)
+	for i := range tail {
+		tail[i] = map[string]any{"seq": float64(40 + i), "event_name": "tool.call"}
+	}
+	poller.observe(tail, nil)
+	if poller.limit != streamWideLimit {
+		t.Fatalf("limit = %d, want widened %d", poller.limit, streamWideLimit)
+	}
+	short := newStreamPoller(10)
+	short.observe(tail[:5], nil)
+	if short.limit != streamTailLimit {
+		t.Fatalf("a short page must not widen the window: %d", short.limit)
+	}
+}
+
+func TestChatStreamProbeRecordsSubscribeWithoutChangingReply(t *testing.T) {
+	recorder := NewProbeRecorder()
+	for _, enabled := range []bool{false, true} {
+		server, wsURL := startChatGateway(t, false)
+		client := NewClientWithWSURL(mustURL(t, server.URL), server.Client(), wsURL)
+		client.SetStreamProbe(recorder)
+		if enabled {
+			recorder.Enable(time.Minute)
+		}
+		gatewayPaths = nil
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		events, err := client.ChatStream(ctx, map[string]string{"hatch_sess": "s"}, "hi", 2*time.Second)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		text := ""
+		for delta := range events {
+			if delta.Err != nil {
+				t.Fatalf("probe=%v stream error: %v", enabled, delta.Err)
+			}
+			text += delta.Text
+		}
+		cancel()
+		if text != "hello" {
+			t.Fatalf("probe=%v changed the reply: %q", enabled, text)
+		}
+		subscribed := strings.Contains(strings.Join(gatewayPaths, " "), "/chat/subscribe")
+		if subscribed != enabled {
+			t.Fatalf("probe=%v subscribed=%v paths=%v", enabled, subscribed, gatewayPaths)
+		}
+	}
+	dump := func() string {
+		raw, _ := json.Marshal(recorder.Entries())
+		return string(raw)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(dump(), "delta.message_done") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	out := dump()
+	for _, want := range []string{`"event":"subscribed"`, `"event":"record"`, "delta.text_append", `"event":"poll_delta"`, "?REDACTED", `"event":"register"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("probe entries missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "probe-secret") {
+		t.Fatalf("probe entries leaked a secret:\n%s", out)
+	}
+	if status := recorder.Status(); !status.Enabled || status.Turns != 1 || status.Entries == 0 {
+		t.Fatalf("status = %+v", status)
+	}
+	recorder.Disable()
+	if recorder.Status().Enabled || len(recorder.Entries()) == 0 {
+		t.Fatal("disable must stop recording but keep records downloadable")
+	}
+}
+
+func TestProbeRecorderExpires(t *testing.T) {
+	recorder := NewProbeRecorder()
+	recorder.Enable(time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if recorder.active() || recorder.Status().Enabled {
+		t.Fatal("probe must switch itself off after its ttl")
 	}
 }
 

@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Archive, CheckCircle2, Copy, Eye, KeyRound, RotateCcw, Server, ShieldCheck, SlidersHorizontal, Timer, Wrench } from 'lucide-react'
+import { Archive, Bug, CheckCircle2, Copy, Download, Eye, KeyRound, RotateCcw, Server, ShieldCheck, SlidersHorizontal, Timer, Trash2, Wrench } from 'lucide-react'
 import { api } from '../lib/api'
 import type { ServiceConfig } from '../lib/types'
-import { Button, ErrorState, Field, InlineError, Input, Loading, PageHeader, RefreshError, SuccessMessage } from '../components/UI'
+import { Button, ErrorState, Field, InlineError, Input, Loading, PageHeader, RefreshError, Select, SuccessMessage } from '../components/UI'
 import { Confirm, Modal } from '../components/Dialog'
 
 type APIKeyInfo = { configured: boolean; api_key_masked: string; base_url: string }
-type SectionId = 'service' | 'credentials' | 'runtime' | 'media' | 'security' | 'maintenance'
+type SectionId = 'service' | 'credentials' | 'runtime' | 'media' | 'security' | 'maintenance' | 'debug'
+type ProbeStatus = { enabled: boolean; until?: number; entries: number; turns: number }
 
 const sections: { id: SectionId; label: string; icon: typeof Server; title: string; description: string }[] = [
   { id: 'service', label: 'API 服务', icon: Server, title: 'API 服务', description: '监听地址、公开入口与本版本信息。' },
@@ -16,6 +17,7 @@ const sections: { id: SectionId; label: string; icon: typeof Server; title: stri
   { id: 'media', label: '媒体与日志', icon: SlidersHorizontal, title: '媒体与日志', description: '媒体目录、访问策略和日志级别。' },
   { id: 'security', label: '安全状态', icon: ShieldCheck, title: '安全状态', description: '凭据加密、会话保护与请求防护。' },
   { id: 'maintenance', label: '维护', icon: Wrench, title: '维护', description: '备份元数据与轮换 API Key。' },
+  { id: 'debug', label: '调试', icon: Bug, title: '调试', description: '临时排查工具；即时生效，无需重启。' },
 ]
 
 export default function Settings() {
@@ -45,7 +47,7 @@ export default function Settings() {
     const elements = Array.from(document.querySelectorAll<HTMLElement>('.settings-section'))
     const observer = new IntersectionObserver(entries => {
       const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 8
-      if (atBottom) { setActive('maintenance'); return }
+      if (atBottom) { setActive('debug'); return }
       const visible = entries.filter(entry => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0]
       if (!visible) return
       const id = visible.target.id.replace('settings-', '') as SectionId
@@ -160,6 +162,11 @@ export default function Settings() {
             <Button variant="danger" onClick={() => setRotateConfirm(true)}><RotateCcw size={15} />轮换</Button>
           </div>
         </section>
+
+        <section className="settings-section" id="settings-debug">
+          <SectionHead icon={Bug} title="调试" description="临时排查工具；即时生效，无需重启。" />
+          <StreamProbePanel />
+        </section>
       </div>
     </div>
 
@@ -187,4 +194,73 @@ function Setting({ label, value, mono = false }: { label: string; value: string;
 
 function SecurityItem({ label, value, warn = false }: { label: string; value: string; warn?: boolean }) {
   return <div className={`security-item ${warn ? 'is-warn' : ''}`}><CheckCircle2 size={15} /><div><strong>{label}</strong><span>{value}</span></div></div>
+}
+
+const probeDurations = [15, 30, 60, 120]
+
+function StreamProbePanel() {
+  const [minutes, setMinutes] = useState(30)
+  const [error, setError] = useState('')
+  const [downloading, setDownloading] = useState(false)
+  const status = useQuery({
+    queryKey: ['stream-probe'],
+    queryFn: ({ signal }) => api<ProbeStatus>('/admin/debug/stream-probe', { signal }),
+    refetchInterval: query => query.state.data?.enabled ? 5000 : false,
+  })
+  const toggle = useMutation({
+    mutationFn: (enabled: boolean) => api<ProbeStatus>('/admin/debug/stream-probe', { method: 'POST', body: JSON.stringify(enabled ? { enabled, minutes } : { enabled }) }),
+    onSuccess: () => { setError(''); void status.refetch() },
+    onError: (err: Error) => setError(err.message),
+  })
+  const clear = useMutation({
+    mutationFn: () => api<ProbeStatus>('/admin/debug/stream-probe/entries', { method: 'DELETE' }),
+    onSuccess: () => { setError(''); void status.refetch() },
+    onError: (err: Error) => setError(err.message),
+  })
+  const download = async () => {
+    setDownloading(true)
+    try {
+      const response = await fetch('/admin/debug/stream-probe/entries', { credentials: 'same-origin' })
+      if (!response.ok) throw new Error(`下载失败（HTTP ${response.status}）`)
+      const name = /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') ?? '')?.[1] ?? 'stream-probe.jsonl'
+      const url = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = name
+      link.click()
+      URL.revokeObjectURL(url)
+      setError('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '下载失败')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  if (status.isLoading) return <Loading />
+  if (status.error && !status.data) return <InlineError>{status.error instanceof Error ? status.error.message : '无法读取探测状态'}</InlineError>
+  const data = status.data
+  if (!data) return null
+  const until = data.until ? new Date(data.until * 1000).toLocaleTimeString() : ''
+  return <div className="form-stack">
+    <div className="maintenance-row">
+      <div className="maintenance-icon"><Bug size={16} /></div>
+      <div>
+        <strong>流式探测 {data.enabled ? <span className="text-success">· 已开启，{until} 自动关闭</span> : <span>· 已关闭</span>}</strong>
+        <p>开启后，每次流式对话会额外订阅上游 chat.subscribe，记录原始事件与轮询出字的时间点，用于实现逐字推送。不影响返回内容。记录含对话原文（令牌、签名已打码），只保存在内存中，服务重启即清空。</p>
+        <p>已记录 {data.turns} 轮对话、{data.entries} 条事件。</p>
+      </div>
+      {data.enabled
+        ? <Button variant="secondary" disabled={toggle.isPending} onClick={() => toggle.mutate(false)}>关闭</Button>
+        : <div className="probe-actions">
+          <Select aria-label="探测时长" value={minutes} onChange={event => setMinutes(Number(event.target.value))}>{probeDurations.map(value => <option key={value} value={value}>{value} 分钟</option>)}</Select>
+          <Button disabled={toggle.isPending} onClick={() => toggle.mutate(true)}>开启</Button>
+        </div>}
+    </div>
+    <div className="probe-actions">
+      <Button variant="secondary" disabled={data.entries === 0 || downloading} onClick={() => void download()}><Download size={15} />{downloading ? '下载中…' : '下载探测记录'}</Button>
+      <Button variant="ghost" disabled={data.entries === 0 || clear.isPending} onClick={() => clear.mutate()}><Trash2 size={15} />清空记录</Button>
+    </div>
+    {error && <InlineError>{error}</InlineError>}
+  </div>
 }

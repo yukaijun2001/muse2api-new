@@ -22,6 +22,7 @@ import (
 	"muse2api/internal/model"
 	"muse2api/internal/muse/capabilities"
 	"muse2api/internal/muse/protocol"
+	"muse2api/internal/muse/protocol/hatch"
 	"muse2api/internal/storage"
 )
 
@@ -681,5 +682,48 @@ func TestAccountProxyIsBoundMaskedAndEditable(t *testing.T) {
 	rec = adminRequest(h, "POST", "/admin/accounts", batch, cookie)
 	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"proxy":"socks5h://10.0.0.4:1080"`) || !strings.Contains(rec.Body.String(), `"proxy":"http://10.0.0.5:3128"`) {
 		t.Fatalf("batch proxies: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+type probingDriver struct {
+	fakeDriver
+	recorder *hatch.ProbeRecorder
+}
+
+func (d *probingDriver) StreamProbe() *hatch.ProbeRecorder { return d.recorder }
+
+func TestStreamProbeAdminSwitch(t *testing.T) {
+	driver := &probingDriver{recorder: hatch.NewProbeRecorder()}
+	_, h := testServer(t, driver)
+	if rec := request(h, "GET", "/admin/debug/stream-probe", "", "test-secret"); rec.Code == 200 {
+		t.Fatal("stream probe must require an admin session, not the API key")
+	}
+	cookie := adminLogin(t, h)
+	rec := adminRequest(h, "POST", "/admin/debug/stream-probe", `{"enabled":true,"minutes":500}`, cookie)
+	if rec.Code != 400 {
+		t.Fatalf("oversized ttl accepted: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = adminRequest(h, "POST", "/admin/debug/stream-probe", `{"enabled":true,"minutes":15}`, cookie)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"enabled":true`) || !strings.Contains(rec.Body.String(), `"until":`) {
+		t.Fatalf("enable: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = adminRequest(h, "GET", "/admin/debug/stream-probe/entries", "", cookie)
+	if rec.Code != 200 || !strings.Contains(rec.Header().Get("Content-Disposition"), "stream-probe-") {
+		t.Fatalf("download: %d %v", rec.Code, rec.Header())
+	}
+	rec = adminRequest(h, "POST", "/admin/debug/stream-probe", `{"enabled":false}`, cookie)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"enabled":false`) {
+		t.Fatalf("disable: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := adminRequest(h, "DELETE", "/admin/debug/stream-probe/entries", "", cookie); rec.Code != 200 {
+		t.Fatalf("clear: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStreamProbeUnsupportedDriver(t *testing.T) {
+	_, h := testServer(t, &fakeDriver{})
+	cookie := adminLogin(t, h)
+	if rec := adminRequest(h, "GET", "/admin/debug/stream-probe", "", cookie); rec.Code != 404 {
+		t.Fatalf("unsupported driver: %d %s", rec.Code, rec.Body.String())
 	}
 }

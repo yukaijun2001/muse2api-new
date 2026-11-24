@@ -1054,6 +1054,8 @@ input[type="checkbox"] { width: 15px; height: 15px; margin: 0; accent-color: var
 .console-media .button { color: #d7d6df; border-color: var(--console-line); background: transparent; }
 .console-media .button:hover { background: #1c1c24; color: #f0eff4; }
 .console-error { margin: 10px 14px 0; }
+.probe-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.probe-actions .select { width: auto; min-width: 104px; }
 
 /* reference image picker */
 .reference-picker { display: flex; flex-direction: column; gap: 7px; }
